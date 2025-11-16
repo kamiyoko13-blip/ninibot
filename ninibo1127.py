@@ -2463,7 +2463,7 @@ def run_bot(exchange, fund_manager_instance):
 
     # DEBUG: run_bot entry
     try:
-        log_debug(f"DEBUG: run_bot start - DRY_RUN={DRY_RUN}, pair={pair}, JAPANESE_YEN_BUDGET={JAPANESE_YEN_BUDGET}")
+        log_debug(f"DEBUG: run_bot start - DRY_RUN={DRY_RUN}, pair={pair}")
     except Exception:
         log_debug("DEBUG: run_bot start (print failed)")
 
