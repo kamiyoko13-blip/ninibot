@@ -1,9 +1,13 @@
 # python 3.14環境で動作確認済み (仮想環境venv314を使用)
 # === 必要なライブラリを1回ずつインポート（心臓部の準備） ===
 
+import os
+from dotenv import load_dotenv
+load_dotenv('/home/ninitan/.secrets/.env', override=True)
 # ccxt がインストールされていない環境でもファイルが読み込めるよう、フォールバックのスタブを用意します。
 try:
     import ccxt  # type: ignore
+    # ...existing code...
 except Exception:
     # 最低限のインターフェースを持つスタブ実装
     class AuthenticationError(Exception):
@@ -26,27 +30,28 @@ except Exception:
 
         def fetch_ohlcv(self, pair, timeframe='1h', limit=250):
             # 空のデータを返して呼び出し側で安全に扱えるようにする
-            return []
-
-        def create_order(self, pair, type_, side, amount, price=None):
-            # ダミー注文レスポンスを返す（cost は計算できる場合のみ設定）
-            cost = None
             try:
-                p = float(price) if price is not None else 0.0
-                cost = float(amount) * p
-            except Exception:
-                cost = None
-            return {'id': 'stub_order', 'pair': pair, 'type': type_, 'side': side, 'amount': amount, 'price': price, 'cost': cost}
-
-    class _CCXTModule:
-        AuthenticationError = AuthenticationError
-        def bitbank(self, config=None):
-            return BitbankStub(config)
-
-    ccxt = _CCXTModule()
-
-# 後続コードが使うために名前を揃える
-# ccxt を直接参照する代わりに、このモジュール内で使う共通の例外参照を作成します。
+                ohlcv_data = exchange.fetch_ohlcv(pair, timeframe, limit=limit)
+                if ohlcv_data:
+                    # データをDataFrameに変換
+                    df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    df = df.set_index('timestamp')
+                    return df
+                else:
+                    try:
+                        print(f"OHLCVデータが取得できませんでした: {pair}")
+                    except Exception:
+                        pass
+                    # エラー時もBotは停止しない
+                    return None
+            except Exception as e:
+                try:
+                    print(f"OHLCVデータの取得中にエラーが発生しました: {exchange.id} {e}")
+                except Exception:
+                    pass
+                # エラー時もBotは停止しない（警告のみ）
+                return None
 # 実環境では ccxt.AuthenticationError が存在します。スタブ環境では上で定義したものが入ります。
 AuthenticationError = getattr(ccxt, 'AuthenticationError', Exception)
 
@@ -837,8 +842,8 @@ COOLDOWN_SEC = int(os.environ.get("COOLDOWN_SEC", "3600"))  # 秒
 TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "5.0"))  # percent
 MAX_ORDER_JPY = int(os.environ.get("MAX_ORDER_JPY", "2000"))  # 1注文上限（JPY）
 STATE_FILE = Path(os.environ.get("TRADING_STATE_FILE", "bot_state.json"))
-# 売買トリガー（%）。ユーザー指定が無ければ 20% を使う。
-TRADE_TRIGGER_PCT = float(os.environ.get('TRADE_TRIGGER_PCT', '20.0'))
+# 売買トリガー（%）。ユーザー指定が無ければ 20%（デフォルト）を使う。
+TRADE_TRIGGER_PCT = float(os.environ.get('TRADE_TRIGGER_PCT', '20.0'))  # 例: 15.0 なら15%
 # 新規: 注文を行うための市場価格閾値（JPY）。この値未満なら発注を行わない。
 MIN_PRICE_THRESHOLD_JPY = float(os.environ.get("MIN_PRICE_THRESHOLD_JPY", "12000000"))
 USE_DYNAMIC_THRESHOLD = str(os.environ.get('USE_DYNAMIC_THRESHOLD', '1')).lower() in ('1', 'true', 'yes', 'on')
@@ -1423,13 +1428,25 @@ def get_order_history(exchange, pair='BTC/JPY', limit=100):
 def cancel_order(exchange, order_id, pair='BTC/JPY'):
     """指定した注文IDの注文をキャンセルします。
     
-    Args:
-        exchange: 取引所オブジェクト
-        order_id: キャンセルする注文のID
-        pair: 通貨ペア
+    try:
+        import ccxt  # type: ignore
+        # ...existing code...
+    except Exception as e:
+        # APIキー認証エラーなどで例外発生時にメール通知
+        try:
+            smtp_host = os.getenv('SMTP_HOST')
+            smtp_port = int(os.getenv('SMTP_PORT', '587'))
+            smtp_user = os.getenv('SMTP_USER')
+            smtp_password = os.getenv('SMTP_PASS')
+            email_to = os.getenv('TO_EMAIL')
+            subject = "【重要】Bitbank API認証エラー発生"
+            message = f"""
     
+    """
+    注文IDで注文をキャンセルします。
+
     Returns:
-        dict: キャンセル結果 or None
+        dict or None: キャンセル結果
     """
     try:
         if str(os.getenv('DRY_RUN', '0')).lower() in ('1', 'true', 'yes', 'on'):
@@ -2498,7 +2515,7 @@ def run_bot(exchange, fund_manager_instance):
         log_info(f"Botを {pair} で実行します。データ取得間隔: {interval_seconds}秒 (1時間)")
 
     # 1回あたりの注文予算（JPY）。ユーザー指定が無ければ 10000 円に変更
-    JAPANESE_YEN_BUDGET = float(os.getenv('JAPANESE_YEN_BUDGET', '10000'))
+    # JAPANESE_YEN_BUDGET = float(os.getenv('JAPANESE_YEN_BUDGET', '10000'))  # ← 使わない
     # 最小購入 BTC 数量（取引所の制約に合わせる）
     MIN_ORDER_BTC = float(os.getenv('MIN_ORDER_BTC', '0.0001'))
     # 小額運用向けの安全設定
@@ -2513,7 +2530,22 @@ def run_bot(exchange, fund_manager_instance):
     except Exception:
         BALANCE_BUFFER = 1000.0
 
-    print(f"💰 1回あたりの注文予算: {JAPANESE_YEN_BUDGET} 円")
+    # available_pre, allowed_by_percent, allowed_by_buffer, reserved_budgetの計算をprintより前に必ず実行
+    try:
+        available_pre = float(fund_manager.available_fund()) if hasattr(fund_manager, 'available_fund') else None
+    except Exception:
+        available_pre = None
+    try:
+        allowed_by_percent = max(0.0, available_pre * float(MAX_RISK_PERCENT)) if available_pre is not None else None
+        allowed_by_buffer = max(0.0, available_pre - float(BALANCE_BUFFER)) if available_pre is not None else None
+    except Exception:
+        allowed_by_percent = None
+        allowed_by_buffer = None
+    if available_pre is not None:
+        reserved_budget = min(allowed_by_percent, allowed_by_buffer)
+    else:
+        reserved_budget = 0.0
+    print(f"💰 1回あたりの注文予算: {reserved_budget:.2f} 円")
     print(f"📉 最低注文数量: {MIN_ORDER_BTC} BTC")
 
     # --- 取引所の残高情報を取得して表示（少額運用向けに簡潔に） ---
@@ -2588,7 +2620,7 @@ def run_bot(exchange, fund_manager_instance):
                     entry_qty = float(last_pos.get('qty', 0))
                     lp = get_latest_price(exchange, pair)
                     if lp is not None:
-                        # TRADE_TRIGGER_PCT を使って利確（デフォルト 20%）
+                        # TRADE_TRIGGER_PCT を使って利確（デフォルトは設定値%）
                         gain_pct = (float(lp) - entry_price) / float(entry_price) * 100.0 if entry_price and entry_price > 0 else 0.0
                         if gain_pct >= float(TRADE_TRIGGER_PCT):
                             print(f"INFO: Trigger sell: gain={gain_pct:.2f}% >= {TRADE_TRIGGER_PCT}% -> selling {entry_qty} at {lp}")
@@ -2850,7 +2882,7 @@ def run_bot(exchange, fund_manager_instance):
 
         # 初期表示用に手数料を考慮した数量を算出
         initial_qty, initial_cost, initial_fee = compute_qty_for_budget_with_fee(
-            float(JAPANESE_YEN_BUDGET), float(latest_price), min_btc=MIN_ORDER_BTC, step=MIN_ORDER_BTC,
+            reserved_budget, float(latest_price), min_btc=MIN_ORDER_BTC, step=MIN_ORDER_BTC,
             available_jpy=None, balance_buffer=float(BALANCE_BUFFER)
         )
         if initial_qty <= 0:
@@ -2890,17 +2922,15 @@ def run_bot(exchange, fund_manager_instance):
         # 予約フェーズ: 価格変動に対応するため、"予算" を先に予約し
         # 注文直前に最新価格を再取得して数量を再計算します。
         # 小額運用向けに、残高の割合やバッファを尊重して予約額を決める
-        reserved_budget = JAPANESE_YEN_BUDGET
+        # 予約額は常に残高のMAX_RISK_PERCENTとBALANCE_BUFFERで決定する
         try:
-            # available を事前取得（lock の外での読み取りで概算を取る）
             available_pre = float(fund_manager.available_fund()) if hasattr(fund_manager, 'available_fund') else None
         except Exception:
             available_pre = None
-        # DEBUG: show pre-reservation estimates (より詳細に出力)
         try:
             allowed_by_percent = max(0.0, available_pre * float(MAX_RISK_PERCENT)) if available_pre is not None else None
             allowed_by_buffer = max(0.0, available_pre - float(BALANCE_BUFFER)) if available_pre is not None else None
-            print(f"DEBUG: pre-reservation: available_pre={available_pre}, reserved_budget={reserved_budget}, allowed_by_percent={allowed_by_percent}, allowed_by_buffer={allowed_by_buffer}")
+            print(f"DEBUG: pre-reservation: available_pre={available_pre}, allowed_by_percent={allowed_by_percent}, allowed_by_buffer={allowed_by_buffer}")
         except Exception:
             pass
 
@@ -2918,13 +2948,10 @@ def run_bot(exchange, fund_manager_instance):
             pass
 
         if available_pre is not None:
-            # 利用可能残高に対する上限 (割合)
-            allowed_by_percent = max(0.0, available_pre * float(MAX_RISK_PERCENT))
-            # 残しておく最低バッファを考慮
-            allowed_by_buffer = max(0.0, available_pre - float(BALANCE_BUFFER))
-            # 実際に予約する金額は、環境変数での予算と上限の小さい方
-            reserved_budget = min(float(JAPANESE_YEN_BUDGET), allowed_by_percent, allowed_by_buffer)
-            # 小額になりすぎないよう安全下限チェックはロック内で行う
+            # reserved_budgetは常に残高の90%とバッファ考慮の小さい方
+            reserved_budget = min(allowed_by_percent, allowed_by_buffer)
+        else:
+            reserved_budget = 0.0
         with FileLock(LOCKFILE, timeout=LOCK_TIMEOUT):
             try:
                 available = float(fund_manager.available_fund()) if hasattr(fund_manager, 'available_fund') else None
@@ -3133,16 +3160,16 @@ def run_bot(exchange, fund_manager_instance):
                 do_buy_by_pct = False
                 try:
                     if latest_price_now is not None and watch_ref is not None:
-                        # 20%下落で買い（上昇は売りなので買わない）
+                        # TRADE_TRIGGER_PCT%下落で買い（上昇は売りなので買わない）
                         threshold_buy = watch_ref * (1.0 - float(TRADE_TRIGGER_PCT) / 100.0)
                         
-                        # 20%下落ラインからさらに5%下落で買いチャンス通知
-                        further_drop_threshold = threshold_buy * 0.95  # 20%下落からさらに5%下落
+                        # TRADE_TRIGGER_PCT%下落ラインからさらに5%下落で買いチャンス通知
+                        further_drop_threshold = threshold_buy * 0.95  # 設定値%下落からさらに5%下落
                         
                         # 下落で買い
                         do_buy_by_pct = float(latest_price_now) <= float(threshold_buy)
                         
-                        # 買いチャンス通知（20%下落 + さらに5%下落 = 合計24%下落）
+                        # 買いチャンス通知（{TRADE_TRIGGER_PCT:.0f}%下落 + さらに5%下落 = 合計{TRADE_TRIGGER_PCT + 5:.0f}%下落）
                         if float(latest_price_now) <= float(further_drop_threshold):
                             # 重複通知防止
                             last_buy_alert = state.get('last_buy_opportunity_alert') if isinstance(state, dict) else None
@@ -3157,7 +3184,7 @@ def run_bot(exchange, fund_manager_instance):
                                     pass
                             
                             if should_alert:
-                                print(f"🎯 買いチャンス！ watch_ref={watch_ref:.0f}円から24%下落 → 現在={latest_price_now:.0f}円")
+                                print(f"🎯 買いチャンス！ watch_ref={watch_ref:.0f}円から{TRADE_TRIGGER_PCT + 5:.0f}%下落 → 現在={latest_price_now:.0f}円")
                                 
                                 # メール通知
                                 try:
@@ -3175,14 +3202,14 @@ def run_bot(exchange, fund_manager_instance):
 
 【価格情報】
 基準価格: {watch_ref:,.0f}円
-20%下落ライン: {threshold_buy:,.0f}円
+{TRADE_TRIGGER_PCT:.0f}%下落ライン: {threshold_buy:,.0f}円
 現在価格: {latest_price_now:,.0f}円
 下落率: {drop_percent:.2f}%
 
 【推奨アクション】
 ✅ bitbankに資金を入金してください
 ✅ 入金後、Botが自動的にBTCを購入します
-✅ 購入価格から20%上昇で自動売却されます
+✅ 購入価格から{TRADE_TRIGGER_PCT:.0f}%上昇で自動売却されます
 
 大きな下落のチャンスです！
 """
@@ -3688,8 +3715,8 @@ Botは自動で取引を試みますが、残高を確認して必要に応じ�
 購入金額: 約{buy_jpy:,.0f}円
 
 【売却目標】
-目標価格: {latest_price * 1.2:,.0f}円 (20%上昇)
-予想利益: 約{buy_jpy * 0.2:,.0f}円
+目標価格: {latest_price * (1 + TRADE_TRIGGER_PCT/100):,.0f}円 ({TRADE_TRIGGER_PCT:.0f}%上昇)
+予想利益: 約{buy_jpy * (TRADE_TRIGGER_PCT/100):,.0f}円
 
 自動売却をお待ちください！
 """
@@ -3825,5 +3852,4 @@ def test_fund_adapter():
         print("dry confirm(300) -> available->", da.available_fund())
     except Exception as e:
         print("dry adapter test failed:", e)
-
 
