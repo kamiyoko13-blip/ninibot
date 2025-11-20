@@ -87,7 +87,8 @@ DYN_THRESHOLD_BUFFER_PCT = 0.01
 DYN_THRESHOLD_RATIO = 1.0
 pair = 'BTC/JPY'
 days = 30
-buffer_jpy = 1000
+import os
+buffer_jpy = int(os.getenv('BALANCE_BUFFER', 1000))
 buffer_pct = 0.01
 # --- 未定義定数・変数のダミー定義 ---
 TRADE_TRIGGER_PCT = 5.0
@@ -407,24 +408,24 @@ def send_notification(smtp_host, smtp_port, smtp_user, smtp_password, to, subjec
     except Exception:
         timeout_sec = 10.0
 
-    if use_ssl:
-        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=timeout_sec) as server:
-            if smtp_user and smtp_password:
-                try:
-                    server.login(smtp_user, smtp_password)
-                except Exception as e:
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=timeout_sec) as server:
+                if smtp_user and smtp_password:
                     try:
-                        log_warn(f'⚠️ SMTP 認証失敗: {e}')
-                    except Exception:
-                        print(f'⚠️ SMTP 認証失敗: {e}')
-            server.send_message(msg)
-    else:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=timeout_sec) as server:
-            try:
-                server.starttls()
-            except Exception:
-                # StartTLS が使えない環境でもログは残す
-                    # 例外時は何もしない
+                        server.login(smtp_user, smtp_password)
+                    except Exception as e:
+                        try:
+                            log_warn(f'⚠️ SMTP 認証失敗: {e}')
+                        except Exception:
+                            print(f'⚠️ SMTP 認証失敗: {e}')
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=timeout_sec) as server:
+                try:
+                    server.starttls()
+                except Exception:
+                    # StartTLS が使えない環境でもログは残す
                     pass
             if smtp_user and smtp_password:
                 try:
@@ -1567,62 +1568,70 @@ def run_bot(exchange, fund_manager_instance):
     except Exception:
         log_info(f"Botを {pair} で実行します。データ取得間隔: {interval_seconds}秒 (1時間)")
 
-    # 注文予算は残高・バッファ・リスク設定から動的に決定（固定予算は使わない）
-    buy_jpy = deposit_detected * 0.99
-    buy_amount_btc = buy_jpy / latest_price
-    # Minimum order size check (0.0001 BTC)
-    if buy_amount_btc >= 0.0001:
-        print(f"Deposit detected: {last_jpy:.0f} JPY -> {current_jpy:.0f} JPY (+{deposit_detected:.0f} JPY)")
-        print(f"Auto-buy: {buy_amount_btc:.4f} BTC @ {latest_price:.0f} JPY (approx. {buy_jpy:.0f} JPY)")
-        try:
-            if not DRY_RUN:
-                # Use limit order slightly above current price
-                limit_price = latest_price * 1.01
-                order = exchange.create_limit_buy_order('BTC/JPY', buy_amount_btc, limit_price)
-                print(f"Buy order placed: {order}")
-                state['watch_reference'] = latest_price
-                state['last_jpy_balance'] = current_jpy - buy_jpy
-                save_state(state)
-                # Purchase notification email
-                try:
-                    smtp_host = os.getenv('SMTP_HOST')
-                    smtp_port = int(os.getenv('SMTP_PORT', '587'))
-                    smtp_user = os.getenv('SMTP_USER')
-                    smtp_password = os.getenv('SMTP_PASS')
-                    email_to = os.getenv('TO_EMAIL')
-                    if smtp_host and email_to:
-                        subject = f"BTC Auto Purchase Complete: {buy_amount_btc:.4f} BTC"
-                        message = (
-                            f"BTC auto purchase completed!\n\n"
-                            f"[Purchase Info]\n"
-                            f"Amount: {buy_amount_btc:.4f} BTC\n"
-                            f"Price: {latest_price:,.0f} JPY/BTC\n"
-                            f"Total: approx. {buy_jpy:,.0f} JPY\n\n"
-                            f"[Sell Target]\n"
-                            f"Target price: {latest_price * (1 + TRADE_TRIGGER_PCT/100):,.0f} JPY (+{TRADE_TRIGGER_PCT:.0f}%)\n"
-                            f"Expected profit: approx. {buy_jpy * (TRADE_TRIGGER_PCT/100):,.0f} JPY\n\n"
-                            f"Please wait for auto-sell trigger."
-                        )
-                        send_notification(smtp_host, smtp_port, smtp_user, smtp_password,
-                                        email_to, subject, message)
-                        print("Purchase notification email sent.")
-                except Exception as e:
-                    print(f"Purchase notification email error: {e}")
-            else:
-                print(f"[DRY RUN] Skipping buy: {buy_amount_btc:.4f} BTC @ {latest_price:.0f} JPY")
-                state['last_jpy_balance'] = current_jpy
-                save_state(state)
-        except Exception as e:
-            print(f"Auto-buy failed: {e}")
-            state['last_jpy_balance'] = current_jpy
-            save_state(state)
-    else:
-        print(f"Buy amount too small: {buy_amount_btc:.6f} BTC (min: 0.0001 BTC)")
-        state['last_jpy_balance'] = current_jpy
-        save_state(state)
-
+    # 1回あたりの注文予算（JPY）。ユーザー指定が無ければ 10000 円に変更
+    # JAPANESE_YEN_BUDGET = float(os.getenv('JAPANESE_YEN_BUDGET', '10000'))  # ← 使わない
+    # 最小購入 BTC 数量（取引所の制約に合わせる）
+    MIN_ORDER_BTC = float(os.getenv('MIN_ORDER_BTC', '0.0001'))
+    # 小額運用向けの安全設定
+    # 1回の注文で使ってよい最大割合 (残高に対するパーセンテージ。例: 0.05 = 5%)
     try:
-        # --- 最近の約定履歴を表示（少額運用では最新2件のみ） ---
+        MAX_RISK_PERCENT = float(os.getenv('MAX_RISK_PERCENT', '0.05'))
+    except Exception:
+        MAX_RISK_PERCENT = 0.05
+    # 注文後に常に残す最低バッファ (JPY)
+    try:
+        BALANCE_BUFFER = float(os.getenv('BALANCE_BUFFER', '1000'))
+    except Exception:
+        BALANCE_BUFFER = 1000.0
+
+    # available_pre, allowed_by_percent, allowed_by_buffer, reserved_budgetの計算をprintより前に必ず実行
+    try:
+        available_pre = float(fund_manager.available_fund()) if hasattr(fund_manager, 'available_fund') else None
+    except Exception:
+        available_pre = None
+    try:
+        allowed_by_percent = max(0.0, available_pre * float(MAX_RISK_PERCENT)) if available_pre is not None else None
+        allowed_by_buffer = max(0.0, available_pre - float(BALANCE_BUFFER)) if available_pre is not None else None
+    except Exception:
+        allowed_by_percent = None
+        allowed_by_buffer = None
+    if available_pre is not None:
+        reserved_budget = min(allowed_by_percent, allowed_by_buffer)
+    else:
+        reserved_budget = 0.0
+    log_info(f"💰 1回あたりの注文予算: {reserved_budget:.2f} 円")
+    log_info(f"📉 最低注文数量: {MIN_ORDER_BTC} BTC")
+
+    # --- 取引所の残高情報を取得して表示（少額運用向けに簡潔に） ---
+    try:
+        balance_info = get_account_balance(exchange)
+        if balance_info and balance_info.get('total'):
+            jpy_free = balance_info['free'].get('JPY', 0)
+            btc_free = balance_info['free'].get('BTC', 0)
+            # 少額運用では利用可能額のみ表示（総額は省略）
+            log_info(f"💼 利用可能残高: JPY={jpy_free:.0f}円, BTC={btc_free:.8f}BTC")
+    except Exception as e:
+        try:
+            log_warn(f"⚠️ 残高取得に失敗: {e}")
+        except Exception:
+            pass
+
+    # --- アクティブな注文を表示（少額運用では簡潔に） ---
+    try:
+        open_orders = get_open_orders(exchange, pair)
+        if open_orders:
+            log_info(f"📋 未約定注文: {len(open_orders)}件")
+            # 少額運用では最大2件まで表示
+            for order in open_orders[:2]:
+                log_info(f"  {order['side'].upper()} {order['amount']:.4f}BTC @ {order['price']:.0f}円")
+    except Exception as e:
+        try:
+            log_warn(f"⚠️ アクティブ注文取得に失敗: {e}")
+        except Exception:
+            pass
+
+    # --- 最近の約定履歴を表示（少額運用では最新2件のみ） ---
+    try:
         my_trades = get_my_trades(exchange, pair, limit=5)
         if my_trades:
             log_info(f"💱 最近の約定: {len(my_trades)}件")
@@ -1646,99 +1655,208 @@ def run_bot(exchange, fund_manager_instance):
         # races with concurrent buy operations that also update the state file.
         LOCKFILE_SELL = os.getenv('ORDER_LOCKFILE', '/tmp/ninibo_order.lock')
         with FileLock(LOCKFILE_SELL, timeout=10):
-            # ...stateの読み込み・利確チェック処理...
-            pass
-    except Exception as e:
-        try:
-            log_warn(f"⚠️ 利確チェック処理に失敗: {e}")
-        except Exception:
-            print(f"⚠️ 利確チェック処理に失敗: {e}")
             state = load_state()
             positions = state.get('positions', []) if isinstance(state, dict) else []
             if positions:
                 # Find the most recent BUY position that has a valid (non-zero) price.
                 last_pos = None
-                try:
-                    # Use a file lock when reading/modifying/saving state for sell flow to avoid
-                    # races with concurrent buy operations that also update the state file.
-                    LOCKFILE_SELL = os.getenv('ORDER_LOCKFILE', '/tmp/ninibo_order.lock')
-                    with FileLock(LOCKFILE_SELL, timeout=10):
-                        state = load_state()
-                        positions = state.get('positions', []) if isinstance(state, dict) else []
-                        if positions:
-                            # Find the most recent BUY position that has a valid (non-zero) price.
-                            last_pos = None
-                            for p in reversed(positions):
-                                try:
-                                    if p.get('side') == 'buy' and float(p.get('price', 0) or 0) > 0:
-                                        last_pos = p
-                                        break
-                                except Exception:
-                                    pass
+                for p in reversed(positions):
+                    try:
+                        if p.get('side') == 'buy' and float(p.get('price', 0) or 0) > 0:
+                            last_pos = p
+                            break
+                    except Exception:
+                        continue
 
-                            # ...existing code...
-
-                            # sell_proceedsの計算は不要なため削除（entry_qty, lp未定義のため）
-                            # 必要なら正しい変数名で再計算してください
-                            # sell_proceeds = None
-
-                            # --- JPYへ戻さずBTC残高のみを元金として管理 ---
-                            # 利確後もBTC残高を維持し、JPY加算やfund_manager.add_fundsは行わない
-                            # 必要に応じて、BTC残高の管理・表示のみを行う
-
+                if last_pos is not None:
+                    entry_price = float(last_pos.get('price', 0))
+                    entry_qty = float(last_pos.get('qty', 0))
+                    lp = get_latest_price(exchange, pair)
+                    if lp is not None:
+                        # TRADE_TRIGGER_PCT を使って利確（デフォルトは設定値%）
+                        gain_pct = (float(lp) - entry_price) / float(entry_price) * 100.0 if entry_price and entry_price > 0 else 0.0
+                        if gain_pct >= float(TRADE_TRIGGER_PCT):
+                            print(f"INFO: Trigger sell: gain={gain_pct:.2f}% >= {TRADE_TRIGGER_PCT}% -> selling {entry_qty} at {lp}")
+                            sell_order = execute_order(exchange, pair, 'sell', entry_qty)
                             try:
-                                print(f"DEBUG: saving state after sell: watch_reference={state.get('watch_reference')} positions_count={len(state.get('positions', []))}")
+                                print(f"DEBUG: post-execute_order sell_order={sell_order}")
                             except Exception:
                                 pass
-
-                            try:
-                                marker = STATE_FILE.with_name(STATE_FILE.name + '.after_sell.marker')
-                                with open(str(marker), 'wb') as mf:
-                                    mf.write(b'REACHED_AFTER_SELL')
+                            if sell_order and isinstance(sell_order, dict) and 'id' in sell_order:
+                                # 売却成功: remove the sold position (the last valid one) and save state
                                 try:
-                                    print(f"DEBUG: wrote marker file {marker}")
-                                except Exception:
-                                    pass
-                            except Exception as e_marker:
-                                try:
-                                    print(f"DEBUG: failed to write marker file: {e_marker}")
-                                except Exception:
-                                    pass
-
-                            try:
-                                dbg_path = STATE_FILE.with_name(STATE_FILE.name + '.after_sell.debug.json')
-                                dbg_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
-                                try:
-                                    print(f"DEBUG: wrote debug snapshot to {dbg_path}")
-                                except Exception:
-                                    pass
-                            except Exception as e_dbg:
-                                try:
-                                    print(f"DEBUG: failed to write debug snapshot: {e_dbg}")
-                                except Exception:
-                                    pass
-
-                            save_state(state)
-                            try:
-                                if STATE_FILE.exists():
-                                    txt = STATE_FILE.read_text(encoding='utf-8')
+                                    removed = False
+                                    for i in range(len(positions)-1, -1, -1):
+                                        try:
+                                            p = positions[i]
+                                            if p.get('side') == 'buy' and float(p.get('price', 0) or 0) == float(entry_price) and float(p.get('qty', 0) or 0) == float(entry_qty):
+                                                try:
+                                                    print(f"DEBUG: removing position at index={i} -> {p}")
+                                                except Exception:
+                                                    pass
+                                                # perform deletion
+                                                del positions[i]
+                                                removed = True
+                                                # Immediately persist a tiny marker and an in-memory snapshot
+                                                try:
+                                                    marker = STATE_FILE.with_name(STATE_FILE.name + f'.after_sell.marker')
+                                                    with open(str(marker), 'wb') as mf:
+                                                        mf.write(b'REACHED_AFTER_SELL')
+                                                    dbg_path = STATE_FILE.with_name(STATE_FILE.name + f'.after_sell.immediate.json')
+                                                    dbg_path.write_text(json.dumps({'positions': positions, 'watch_reference': state.get('watch_reference')}, ensure_ascii=False, indent=2), encoding='utf-8')
+                                                    try:
+                                                        print(f"DEBUG: immediate marker and snapshot written: {marker}, {dbg_path}")
+                                                    except Exception:
+                                                        pass
+                                                except Exception as e_immediate:
+                                                    try:
+                                                        print(f"DEBUG: failed immediate marker/snapshot write: {e_immediate}")
+                                                    except Exception:
+                                                        pass
+                                                break
+                                        except Exception as e_rem:
+                                            try:
+                                                print(f"DEBUG: exception while scanning positions for removal: {e_rem}")
+                                            except Exception:
+                                                pass
+                                            continue
+                                    if not removed:
+                                        try:
+                                            print("DEBUG: no exact matching position found to remove; will attempt to pop last element")
+                                        except Exception:
+                                            pass
+                                        try:
+                                            positions = positions[:-1]
+                                        except Exception as e_pop:
+                                            try:
+                                                print(f"DEBUG: failed to pop last position: {e_pop}")
+                                            except Exception:
+                                                pass
+                                    state['positions'] = positions
+                                except Exception as e_state:
                                     try:
-                                        print(f"DEBUG: post-save STATE_FILE len={len(txt)}")
+                                        print(f"DEBUG: exception while removing position: {e_state}")
                                     except Exception:
                                         pass
-                            except Exception:
+                                    # fallback: pop the last element
+                                    try:
+                                        state['positions'] = positions[:-1]
+                                    except Exception:
+                                        pass
+                                # 売却後は監視基準価格を最新価格にリセット
                                 try:
-                                    print(f"DEBUG: could not read state file after save")
+                                    state['watch_reference'] = float(lp)
+                                except Exception:
+                                    pass
+                                # 売却成功時に売却代金をファンドへ戻す（実運用／DRY_RUN に対して適切な API を呼ぶ）
+                                try:
+                                    sell_proceeds = None
+                                    if isinstance(sell_order, dict):
+                                        sell_proceeds = sell_order.get('cost')
+                                    if not sell_proceeds:
+                                        # フォールバック: 最新価格 * 数量
+                                        try:
+                                            sell_proceeds = float(entry_qty) * float(lp)
+                                        except Exception:
+                                            sell_proceeds = None
+                                    if sell_proceeds is not None:
+                                        try:
+                                            lock_timeout_local = float(os.getenv('ORDER_LOCK_TIMEOUT', '10'))
+                                            with FileLock(LOCKFILE_SELL, timeout=lock_timeout_local):
+                                                if hasattr(fund_manager, 'add_funds'):
+                                                    fund_manager.add_funds(float(sell_proceeds))
+                                                else:
+                                                    # もし underlying が reservation-style を持たない場合は警告
+                                                    try:
+                                                        print("⚠️ fund_manager に add_funds メソッドがありません。手動で残高調整が必要です。")
+                                                    except Exception:
+                                                        pass
+                                        except Exception as e_add:
+                                            try:
+                                                print(f"⚠️ 売却代金のファンド加算に失敗しました: {e_add}")
+                                            except Exception:
+                                                pass
+                                except Exception:
+                                    pass
+                                # 保存前に内容をデバッグ出力
+                                try:
+                                    print(f"DEBUG: saving state after sell: watch_reference={state.get('watch_reference')} positions_count={len(state.get('positions', []))}")
+                                except Exception:
+                                    pass
+                                # Immediately create a lightweight marker file to prove we reached
+                                # this point. Use binary write to avoid encoding surprises.
+                                try:
+                                    marker = STATE_FILE.with_name(STATE_FILE.name + '.after_sell.marker')
+                                    with open(str(marker), 'wb') as mf:
+                                        mf.write(b'REACHED_AFTER_SELL')
+                                    try:
+                                        print(f"DEBUG: wrote marker file {marker}")
+                                    except Exception:
+                                        pass
+                                except Exception as e_marker:
+                                    try:
+                                        print(f"DEBUG: failed to write marker file: {e_marker}")
+                                    except Exception:
+                                        pass
+                                # Immediately dump an auxiliary debug file to make the in-memory
+                                # state observable even if save_state fails or gets overwritten.
+                                try:
+                                    dbg_path = STATE_FILE.with_name(STATE_FILE.name + '.after_sell.debug.json')
+                                    dbg_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
+                                    try:
+                                        print(f"DEBUG: wrote debug snapshot to {dbg_path}")
+                                    except Exception:
+                                        pass
+                                except Exception as e_dbg:
+                                    try:
+                                        print(f"DEBUG: failed to write debug snapshot: {e_dbg}")
+                                    except Exception:
+                                        pass
+                                save_state(state)
+                                try:
+                                    if STATE_FILE.exists():
+                                        txt = STATE_FILE.read_text(encoding='utf-8')
+                                        try:
+                                            print(f"DEBUG: post-save STATE_FILE len={len(txt)}")
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    try:
+                                        print(f"DEBUG: could not read state file after save")
+                                    except Exception:
+                                        pass
+
+                                # Ensure proceeds are persisted to underlying fund file in DRY_RUN tests too
+                                try:
+                                    # primary: adapter-level add_funds (may be local in DRY_RUN)
+                                    if sell_proceeds is not None:
+                                        try:
+                                            fund_manager.add_funds(float(sell_proceeds))
+                                        except Exception:
+                                            pass
+                                    # fallback: if adapter wraps an underlying object that supports add_funds, call it to persist
+                                    underlying = getattr(fund_manager, '_underlying', None)
+                                    if underlying is not None and hasattr(underlying, 'add_funds'):
+                                        try:
+                                            # write under lock to avoid races
+                                            lockfile_main = os.getenv('ORDER_LOCKFILE') or str(STATE_FILE.with_name('.ninibo_order.lock'))
+                                            lock_timeout_local = float(os.getenv('ORDER_LOCK_TIMEOUT', '10'))
+                                            with FileLock(lockfile_main, timeout=lock_timeout_local):
+                                                underlying.add_funds(float(sell_proceeds))
+                                        except Exception:
+                                            pass
                                 except Exception:
                                     pass
 
-                            # --- JPYへ戻さずBTC残高のみを元金として管理 ---
-                            # sell_proceedsやfund_manager.add_fundsの処理は完全に削除
-
-                            print("✅ Trigger sell: position sold and state updated")
-                            return
-                except Exception as e:
-                    print(f"⚠️ 利確チェック中にエラー: {e}")
+                                print("✅ Trigger sell: position sold and state updated")
+                                # Exit this run after successful sell to avoid later logic
+                                # (e.g. buy path) overwriting the updated state file.
+                                return
+                                # After a successful sell and state persist, return early to avoid subsequent
+                                # buy logic in the same run from overwriting the state file.
+                                return
+    except Exception as e:
+        print(f"⚠️ 利確チェック中にエラー: {e}")
 
     # --- 取引許可日のチェック (週末限定など) ---
     tz_name = os.getenv('TRADE_TIMEZONE')
