@@ -84,6 +84,7 @@ env_paths = ['.env']
 DYN_OHLCV_DAYS = 30
 DYN_THRESHOLD_BUFFER_JPY = 1000
 DYN_THRESHOLD_BUFFER_PCT = 0.01
+env_loaded = False
 DYN_THRESHOLD_RATIO = 1.0
 pair = 'BTC/JPY'
 days = 30
@@ -91,7 +92,7 @@ import os
 buffer_jpy = int(os.getenv('BALANCE_BUFFER', 1000))
 buffer_pct = 0.01
 # --- 未定義定数・変数のダミー定義 ---
-TRADE_TRIGGER_PCT = 5.0
+TRADE_TRIGGER_PCT = 10.0
 MIN_PRICE_THRESHOLD_JPY = 1000
 USE_DYNAMIC_THRESHOLD = True
 MIN_ORDER_BTC = 0.0001
@@ -130,8 +131,9 @@ import logging
 # --- ロギング関数の再定義 ---
 import datetime
 import time
+from filelock import FileLock
 import sys
-from threading import Lock as FileLock
+
 
 # log_info, log_warn, log_debug, log_error の重複定義を防ぐ
 # すでにファイル先頭で定義済みなので、以降の重複定義は削除
@@ -145,16 +147,13 @@ reserved_budget = 0
 fund_manager = None
 # --- connect_to_bitbank: Bitbank用の簡易接続関数（未定義エラー対策のダミー実装） ---
 def connect_to_bitbank():
-    # TODO: 実際のAPI接続処理に置き換えてください
-    class DummyExchange:
-        def fetch_ohlcv(self, *a, **kw): return []
-        def fetch_trades(self, *a, **kw): return []
-        def fetch_order_book(self, *a, **kw): return {'bids': [], 'asks': []}
-        def withdraw(self, *a, **kw): return {'id': 'dummy', 'currency': 'BTC', 'amount': 0}
-        def fetch_orders(self, *a, **kw): return []
-        def cancel_order(self, *a, **kw): return {'id': 'dummy', 'status': 'canceled'}
-        def fetch_balance(self, *a, **kw): return {'total': {}, 'free': {}, 'used': {}}
-    return DummyExchange()
+    import ccxt
+    api_key = os.getenv("API_KEY")
+    secret_key = os.getenv("SECRET_KEY")
+    return ccxt.bitbank({
+        'apiKey': api_key,
+        'secret': secret_key,
+    })
 
 
 # ccxt がインストールされていない環境でもファイルが読み込めるよう、フォールバックのスタブを用意します。
@@ -408,25 +407,24 @@ def send_notification(smtp_host, smtp_port, smtp_user, smtp_password, to, subjec
     except Exception:
         timeout_sec = 10.0
 
-    try:
-        if use_ssl:
-            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=timeout_sec) as server:
-                if smtp_user and smtp_password:
-                    try:
-                        server.login(smtp_user, smtp_password)
-                    except Exception as e:
-                        try:
-                            log_warn(f'⚠️ SMTP 認証失敗: {e}')
-                        except Exception:
-                            print(f'⚠️ SMTP 認証失敗: {e}')
-                server.send_message(msg)
-        else:
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=timeout_sec) as server:
+    if use_ssl:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=timeout_sec) as server:
+            if smtp_user and smtp_password:
                 try:
-                    server.starttls()
-                except Exception:
-                    # StartTLS が使えない環境でもログは残す
-                    pass
+                    server.login(smtp_user, smtp_password)
+                except Exception as e:
+                    try:
+                        log_warn(f'⚠️ SMTP 認証失敗: {e}')
+                    except Exception:
+                        print(f'⚠️ SMTP 認証失敗: {e}')
+            server.send_message(msg)
+    else:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=timeout_sec) as server:
+            try:
+                server.starttls()
+            except Exception:
+                # StartTLS が使えない環境でもログは残す
+                pass
             if smtp_user and smtp_password:
                 try:
                     server.login(smtp_user, smtp_password)
@@ -480,6 +478,7 @@ SECRET_KEY = os.getenv("SECRET_KEY") # グローバル定数として定義
 # 日本標準時 (JST) のタイムゾーンオブジェクトを作成
 try:
     pass  # ← ここに必要な処理があれば記述
+# 例外処理が不要なら except で何もしない
 except Exception:
     JST = datetime.timezone(datetime.timedelta(hours=9))
 
@@ -1589,17 +1588,16 @@ def run_bot(exchange, fund_manager_instance):
         available_pre = float(fund_manager.available_fund()) if hasattr(fund_manager, 'available_fund') else None
     except Exception:
         available_pre = None
+    # --- ここから修正: 必ず1000円残し、それ以外は全額使う ---
     try:
-        allowed_by_percent = max(0.0, available_pre * float(MAX_RISK_PERCENT)) if available_pre is not None else None
-        allowed_by_buffer = max(0.0, available_pre - float(BALANCE_BUFFER)) if available_pre is not None else None
+        BALANCE_BUFFER = float(os.getenv('BALANCE_BUFFER', '1000'))
     except Exception:
-        allowed_by_percent = None
-        allowed_by_buffer = None
+        BALANCE_BUFFER = 1000.0
     if available_pre is not None:
-        reserved_budget = min(allowed_by_percent, allowed_by_buffer)
+        reserved_budget = max(0.0, available_pre - BALANCE_BUFFER)
     else:
         reserved_budget = 0.0
-    log_info(f"💰 1回あたりの注文予算: {reserved_budget:.2f} 円")
+    log_info(f"💰 1回あたりの注文予算: {reserved_budget:.2f} 円（常に{BALANCE_BUFFER:.0f}円残し）")
     log_info(f"📉 最低注文数量: {MIN_ORDER_BTC} BTC")
 
     # --- 取引所の残高情報を取得して表示（少額運用向けに簡潔に） ---
@@ -1654,7 +1652,7 @@ def run_bot(exchange, fund_manager_instance):
         # Use a file lock when reading/modifying/saving state for sell flow to avoid
         # races with concurrent buy operations that also update the state file.
         LOCKFILE_SELL = os.getenv('ORDER_LOCKFILE', '/tmp/ninibo_order.lock')
-        with FileLock(LOCKFILE_SELL, timeout=10):
+        with FileLock(LOCKFILE_SELL):
             state = load_state()
             positions = state.get('positions', []) if isinstance(state, dict) else []
             if positions:
@@ -1762,7 +1760,7 @@ def run_bot(exchange, fund_manager_instance):
                                     if sell_proceeds is not None:
                                         try:
                                             lock_timeout_local = float(os.getenv('ORDER_LOCK_TIMEOUT', '10'))
-                                            with FileLock(LOCKFILE_SELL, timeout=lock_timeout_local):
+                                            with FileLock(LOCKFILE_SELL):
                                                 if hasattr(fund_manager, 'add_funds'):
                                                     fund_manager.add_funds(float(sell_proceeds))
                                                 else:
@@ -1841,7 +1839,7 @@ def run_bot(exchange, fund_manager_instance):
                                             # write under lock to avoid races
                                             lockfile_main = os.getenv('ORDER_LOCKFILE') or str(STATE_FILE.with_name('.ninibo_order.lock'))
                                             lock_timeout_local = float(os.getenv('ORDER_LOCK_TIMEOUT', '10'))
-                                            with FileLock(lockfile_main, timeout=lock_timeout_local):
+                                            with FileLock(lockfile_main):
                                                 underlying.add_funds(float(sell_proceeds))
                                         except Exception:
                                             pass
@@ -1894,7 +1892,7 @@ def run_bot(exchange, fund_manager_instance):
             # races with concurrent buy operations that also update the state file.
             LOCKFILE_SELL = os.getenv('ORDER_LOCKFILE', '/tmp/ninibo_order.lock')
             try:
-                with FileLock(LOCKFILE_SELL, timeout=10):
+                with FileLock(LOCKFILE_SELL):
                     state = load_state()
                     positions = state.get('positions', []) if isinstance(state, dict) else []
                     if positions:
@@ -1994,7 +1992,7 @@ def run_bot(exchange, fund_manager_instance):
             reserved_budget = min(allowed_by_percent, allowed_by_buffer)
         else:
             reserved_budget = 0.0
-        with FileLock(LOCKFILE, timeout=LOCK_TIMEOUT):
+        with FileLock(LOCKFILE):
             try:
                 available = float(fund_manager.available_fund()) if hasattr(fund_manager, 'available_fund') else None
             except Exception:
@@ -2304,7 +2302,7 @@ def run_bot(exchange, fund_manager_instance):
                 if not do_buy:
                     print(f"🚫 買い条件未達（watch_ref={watch_ref}, latest={latest_price_now}, buy_pct={TRADE_TRIGGER_PCT}, breakout_allowed={allow_buy_by_breakout}）→ 予約を返金して終了")
                     if reserved:
-                        with FileLock(LOCKFILE, timeout=LOCK_TIMEOUT):
+                        with FileLock(LOCKFILE):
                             if hasattr(fund_manager, 'release'):
                                 fund_manager.release(reserved_budget)
                             elif hasattr(fund_manager, 'add_funds'):
@@ -2315,7 +2313,7 @@ def run_bot(exchange, fund_manager_instance):
                 # 比較中のエラーは安全側でキャンセルする
                 print("⚠️ 売買判定でエラーが発生しました。発注を中断します。")
                 if reserved:
-                    with FileLock(LOCKFILE, timeout=LOCK_TIMEOUT):
+                    with FileLock(LOCKFILE):
                         if hasattr(fund_manager, 'release'):
                             fund_manager.release(reserved_budget)
                         elif hasattr(fund_manager, 'add_funds'):
@@ -2325,7 +2323,7 @@ def run_bot(exchange, fund_manager_instance):
             if latest_price_now is None:
                 print("⚠️ 注文直前に価格が取得できませんでした。予約を取り消します。")
                 try:
-                    with FileLock(LOCKFILE, timeout=LOCK_TIMEOUT):
+                    with FileLock(LOCKFILE):
                         if hasattr(fund_manager, 'release'):
                             fund_manager.release(reserved_budget)
                         elif hasattr(fund_manager, 'add_funds'):
@@ -2335,7 +2333,7 @@ def run_bot(exchange, fund_manager_instance):
                 except Exception as e:
                     print(f"⚠️ 予約取り消し（返金）に失敗しました: {e}")
                     if reserved:
-                        with FileLock(LOCKFILE, timeout=LOCK_TIMEOUT):
+                        with FileLock(LOCKFILE):
                             if hasattr(fund_manager, 'release'):
                                 fund_manager.release(reserved_budget)
                             elif hasattr(fund_manager, 'add_funds'):
@@ -2351,7 +2349,7 @@ def run_bot(exchange, fund_manager_instance):
             if final_qty <= 0:
                 print(f"ℹ️ 注文直前で数量が最小取引単位を下回りましたまたは手数料で合計が超過しました。予約を取り消します。")
                 if reserved:
-                    with FileLock(LOCKFILE, timeout=LOCK_TIMEOUT):
+                    with FileLock(LOCKFILE):
                         if hasattr(fund_manager, 'release'):
                             fund_manager.release(reserved_budget)
                         elif hasattr(fund_manager, 'add_funds'):
@@ -2371,7 +2369,7 @@ def run_bot(exchange, fund_manager_instance):
             # 例外時は予約を取り消して返金
             if reserved:
                 try:
-                    with FileLock(LOCKFILE, timeout=LOCK_TIMEOUT):
+                    with FileLock(LOCKFILE):
                         if hasattr(fund_manager, 'release'):
                             fund_manager.release(reserved_budget)
                         elif hasattr(fund_manager, 'add_funds'):
@@ -2488,7 +2486,7 @@ def run_bot(exchange, fund_manager_instance):
                 pass
             if reserved:
                 try:
-                    with FileLock(LOCKFILE, timeout=LOCK_TIMEOUT):
+                    with FileLock(LOCKFILE):
                         if hasattr(fund_manager, 'release'):
                             fund_manager.release(reserved_budget)
                         elif hasattr(fund_manager, 'add_funds'):
