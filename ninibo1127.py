@@ -155,6 +155,11 @@ def connect_to_bitbank():
         'secret': secret_key,
     })
 
+# --- データ取得専用: Binanceインスタンス生成関数 ---
+def connect_to_binance():
+    import ccxt
+    return ccxt.binance()  # publicデータ取得のみ（APIキー不要）
+
 
 # ccxt がインストールされていない環境でもファイルが読み込めるよう、フォールバックのスタブを用意します。
 try:
@@ -578,9 +583,16 @@ def test_fund_adapter():
 # === 2. 価格データの取得 ===
 def get_ohlcv(exchange, pair='BTC/JPY', timeframe='1h', limit=250):
     """
+    OHLCVデータ取得: bitbankインスタンスが渡された場合はbinanceから取得する
     """
     try:
-        ohlcv_data = exchange.fetch_ohlcv(pair, timeframe, limit=limit)
+        # bitbankインスタンスならbinanceでデータ取得
+        if hasattr(exchange, 'id') and getattr(exchange, 'id', None) == 'bitbank':
+            log_info("bitbank注文用、データ取得はbinanceから行います")
+            binance = connect_to_binance()
+            ohlcv_data = binance.fetch_ohlcv(pair.replace('JPY', 'USDT'), timeframe, limit=limit)
+        else:
+            ohlcv_data = exchange.fetch_ohlcv(pair, timeframe, limit=limit)
 
         if ohlcv_data:
             # データをDataFrameに変換
