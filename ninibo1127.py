@@ -2786,7 +2786,9 @@ def run_bot_di(dry_run=False, exchange_override=None):
     fund_manager = None
     
     try:
-        run_bot_di()
+        # TODO: ここでBotのメイン処理関数を呼び出してください（例: run_bot(exchange, fund_manager, actual_dry_run) など）
+        # run_bot(exchange, fund_manager, actual_dry_run)
+        print("[仮] Botメイン処理をここで実行")
         return {"status": "success", "message": "Bot実行完了"}
     except Exception as e:
         return {"status": "error", "message": f"Bot実行中にエラー: {e}"}
