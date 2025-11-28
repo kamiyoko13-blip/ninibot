@@ -448,12 +448,23 @@ exchange_name = os.getenv("EXCHANGE", "bitbank")
 
 
 # === メイン処理開始（Botの心臓が動き出す） ===
+
 if __name__ == "__main__":
+    # --- 多重起動防止: FileLockで排他制御 ---
+    from filelock import Timeout, FileLock
+    LOCKFILE_PATH = os.getenv('ORDER_LOCKFILE', '/tmp/ninibo_order.lock')
+    lock = FileLock(LOCKFILE_PATH)
+    try:
+        lock.acquire(timeout=1)
+    except Timeout:
+        print("❌ すでにBotが起動中です。多重起動はできません。終了します。")
+        sys.exit(1)
     try:
         log_info("Bot起動中...")
     except Exception:
         log_info("Bot起動中...")
-    # run_botの定義後に呼び出すように移動しました
+    # run_bot_diを呼び出す
+    run_bot_di()
 
 # 1. 初期設定と認証 (APIキーの読み込みはここにあります)
 
@@ -2719,7 +2730,7 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"⚠️ 残高チェック・自動購入処理中にエラー: {e}")
 
-            run_bot(exchange, fund_manager)
+            run_bot_di()
 
             # 従来の毎ループ入金（あえて残す。ENVで無効化可）
             try:
@@ -2775,7 +2786,7 @@ def run_bot_di(dry_run=False, exchange_override=None):
     fund_manager = None
     
     try:
-        run_bot(exchange, fund_manager)
+        run_bot_di()
         return {"status": "success", "message": "Bot実行完了"}
     except Exception as e:
         return {"status": "error", "message": f"Bot実行中にエラー: {e}"}
