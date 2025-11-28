@@ -1,3 +1,5 @@
+# データ取得間隔（秒）
+interval_seconds = 3600
 # --- ロギング関数の再定義 ---
 def log_info(*args, **kwargs):
     try:
@@ -89,7 +91,7 @@ DYN_THRESHOLD_RATIO = 1.0
 pair = 'BTC/JPY'
 days = 30
 import os
-buffer_jpy = int(os.getenv('BALANCE_BUFFER', 1000))
+buffer_jpy = int(os.getenv('BALANCE_BUFFER', 500))
 buffer_pct = 0.01
 # --- 未定義定数・変数のダミー定義 ---
 TRADE_TRIGGER_PCT = 10.0
@@ -154,11 +156,6 @@ def connect_to_bitbank():
         'apiKey': api_key,
         'secret': secret_key,
     })
-
-# --- データ取得専用: Binanceインスタンス生成関数 ---
-def connect_to_binance():
-    import ccxt
-    return ccxt.binance()  # publicデータ取得のみ（APIキー不要）
 
 
 # ccxt がインストールされていない環境でもファイルが読み込めるよう、フォールバックのスタブを用意します。
@@ -583,16 +580,9 @@ def test_fund_adapter():
 # === 2. 価格データの取得 ===
 def get_ohlcv(exchange, pair='BTC/JPY', timeframe='1h', limit=250):
     """
-    OHLCVデータ取得: bitbankインスタンスが渡された場合はbinanceから取得する
     """
     try:
-        # bitbankインスタンスならbinanceでデータ取得
-        if hasattr(exchange, 'id') and getattr(exchange, 'id', None) == 'bitbank':
-            log_info("bitbank注文用、データ取得はbinanceから行います")
-            binance = connect_to_binance()
-            ohlcv_data = binance.fetch_ohlcv(pair.replace('JPY', 'USDT'), timeframe, limit=limit)
-        else:
-            ohlcv_data = exchange.fetch_ohlcv(pair, timeframe, limit=limit)
+        ohlcv_data = exchange.fetch_ohlcv(pair, timeframe, limit=limit)
 
         if ohlcv_data:
             # データをDataFrameに変換
@@ -1349,6 +1339,7 @@ def set_last_buy_time(state, ts=None):
 
 
 def record_position(state, side, price, qty):
+    print("DEBUG: record_position called", side, price, qty)
     state.setdefault("positions", [])
     state["positions"].append({
         "side": side,
@@ -1358,10 +1349,13 @@ def record_position(state, side, price, qty):
     })
     if len(state["positions"]) > 50:
         state["positions"] = state["positions"][-50:]
+    print(f"DEBUG: record_position saving state with positions={state['positions']}")
     save_state(state)
+    print("DEBUG: record_position finished")
 
 
 def is_slippage_too_large(reference_price, latest_price):
+    print("DEBUG: save_state called")
     try:
         if reference_price is None or latest_price is None:
             return False
@@ -1512,36 +1506,8 @@ def _ensure_fund_manager_has_funds(fm, initial_amount=None):
         auto_fix = False
 
     if not auto_fix:
+        # 不要なtmp_path関連の処理を削除
         return
-
-    try:
-        avail = float(fm.available_fund())
-    except Exception:
-        avail = 0.0
-
-    if avail and avail > 0:
-        return
-
-    # determine top-up amount; allow override via AUTO_FIX_AMOUNT (JPY)
-    try:
-        if initial_amount is not None:
-            initial = float(initial_amount)
-        else:
-            initial = float(os.getenv('AUTO_FIX_AMOUNT', os.getenv('INITIAL_FUND', '20000')))
-    except Exception:
-        initial = 20000.0
-
-    try:
-        fm.add_funds(initial)
-        print(f"🔧 funds were zero; auto-added {initial:.0f} JPY to fund_manager (AUTO_FIX_FUNDS)")
-    except Exception as e:
-        print(f"⚠️ failed to auto-fix fund_manager funds: {e}")
-
-# 修正点: グローバルキーを使用するため、api_keyとsecret_keyの引数を削除
-def run_bot(exchange, fund_manager_instance):
-    # Main execution for BTC auto-trading bot (single run)
-    pair = 'BTC/JPY'
-    interval_seconds = 3600
 
     # DEBUG: run_bot entry
     try:
@@ -1591,9 +1557,9 @@ def run_bot(exchange, fund_manager_instance):
         MAX_RISK_PERCENT = 0.05
     # 注文後に常に残す最低バッファ (JPY)
     try:
-        BALANCE_BUFFER = float(os.getenv('BALANCE_BUFFER', '1000'))
+        BALANCE_BUFFER = float(os.getenv('BALANCE_BUFFER', '500'))
     except Exception:
-        BALANCE_BUFFER = 1000.0
+        BALANCE_BUFFER = 500.0
 
     # available_pre, allowed_by_percent, allowed_by_buffer, reserved_budgetの計算をprintより前に必ず実行
     try:
@@ -1621,6 +1587,7 @@ def run_bot(exchange, fund_manager_instance):
             # 少額運用では利用可能額のみ表示（総額は省略）
             log_info(f"💼 利用可能残高: JPY={jpy_free:.0f}円, BTC={btc_free:.8f}BTC")
     except Exception as e:
+        print(f"DEBUG: save_state exception: {e}")
         try:
             log_warn(f"⚠️ 残高取得に失敗: {e}")
         except Exception:
