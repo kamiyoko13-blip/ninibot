@@ -31,51 +31,8 @@ def log_warn(*args, **kwargs):
     except Exception:
         print(msg)
 
-def log_error(*args, **kwargs):
-    try:
-        msg = ' '.join(str(a) for a in args)
-    except Exception:
-        msg = str(args)
-    try:
-        import logging
-        logging.getLogger().error(msg)
-    except Exception:
-        pass
-    try:
-        print(msg, **kwargs)
-    except Exception:
-        print(msg)
 
-def log_debug(*args, **kwargs):
-    try:
-        msg = ' '.join(str(a) for a in args)
-    except Exception:
-        msg = str(args)
-    try:
-        import logging
-        logging.getLogger().debug(msg)
-    except Exception:
-        pass
-    try:
-        print(msg, **kwargs)
-    except Exception:
-        print(msg)
-
-# --- FundManager, FundAdapter, _adapt_fund_manager_instance のダミー定義 ---
-class FundManager:
-    def __init__(self, initial_fund=0, state_file=None):
-        self.fund = initial_fund
-    def available_fund(self):
-        return self.fund
-    def add_funds(self, amount):
-        self.fund += amount
-    def reserve(self, cost):
-        if self.fund >= cost:
-            self.fund -= cost
-            return True
-        return False
-    def release(self, cost):
-        self.fund += cost
+# === DI対応版のエントリーポイント ===
 
 # --- 未定義グローバル変数・定数・関数のダミー定義・import ---
 try:
@@ -463,7 +420,7 @@ if __name__ == "__main__":
         log_info("Bot起動中...")
     except Exception:
         log_info("Bot起動中...")
-    # run_bot_diを呼び出す
+    # Botのメイン処理を呼び出し（自動売買ロジック有効化）
     run_bot_di()
 
 # 1. 初期設定と認証 (APIキーの読み込みはここにあります)
@@ -2730,7 +2687,7 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"⚠️ 残高チェック・自動購入処理中にエラー: {e}")
 
-            run_bot_di()
+            
 
             # 従来の毎ループ入金（あえて残す。ENVで無効化可）
             try:
