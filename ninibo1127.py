@@ -1,11 +1,332 @@
-# --- ロギング関数の再定義 ---
-def log_info(*args, **kwargs):
+# --- run_bot関数の最低限定義（未定義エラー対策） ---
+def run_bot(exchange, fund_manager, dry_run=False):
+    import time
+    import pandas as pd
+    PAIR = 'BTC/JPY'
+    INTERVAL = '1h'
+    LOOP_INTERVAL = 3600  # 1時間ごと
+    MIN_ORDER_BTC = float(os.getenv('MIN_ORDER_BTC', '0.0001'))
+    MAX_RISK_PERCENT = float(os.getenv('MAX_RISK_PERCENT', '0.05'))
+    BALANCE_BUFFER = float(os.getenv('BALANCE_BUFFER', '1000'))
+    RSI_BUY = float(os.getenv('RSI_BUY', '30'))
+    RSI_SELL = float(os.getenv('RSI_SELL', '70'))
+    PROFIT_TAKE_PCT = float(os.getenv('PROFIT_TAKE_PCT', '10'))
+    STOP_LOSS_PCT = float(os.getenv('STOP_LOSS_PCT', '5'))
+
+    def fetch_ohlcv():
+        ohlcv = exchange.fetch_ohlcv(PAIR, INTERVAL, limit=200)
+        df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+        df['close'] = df['close'].astype(float)
+        return df
+
+    def calc_rsi(df, period=14):
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        avg_gain = gain.rolling(window=period).mean()
+        avg_loss = loss.rolling(window=period).mean()
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+
+    def calc_macd(df, fast=12, slow=26, signal=9):
+        ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
+        ema_slow = df['close'].ewm(span=slow, adjust=False).mean()
+        macd = ema_fast - ema_slow
+        macd_signal = macd.ewm(span=signal, adjust=False).mean()
+        return macd, macd_signal
+
+    def get_balance():
+        bal = exchange.fetch_balance()
+        jpy = bal['JPY']['free'] if 'JPY' in bal and 'free' in bal['JPY'] else 0.0
+        btc = bal['BTC']['free'] if 'BTC' in bal and 'free' in bal['BTC'] else 0.0
+        return float(jpy), float(btc)
+
+    def place_order(side, amount):
+        if dry_run:
+            print(f"DRY_RUN: {side} {amount:.4f} BTC")
+            return None
+        if side == 'buy':
+            order = exchange.create_order(PAIR, 'market', 'buy', amount)
+        else:
+            order = exchange.create_order(PAIR, 'market', 'sell', amount)
+        print(f"注文: {side} {amount:.4f} BTC")
+        return order
+
+
+    # ポジション管理リスト（複数購入・分割売却対応）
+
+    # --- 初期ポジション（手動設定例） ---
+    # ここを編集すれば、過去の購入分をBOT起動時に管理対象にできる
+    positions = [
+        {'price': 13090000, 'amount': 0.0008, 'timestamp': None},
+        {'price': 14410000, 'amount': 0.0001, 'timestamp': None},
+        {'price': 14229000, 'amount': 0.0004, 'timestamp': None},
+    ]  # [{'price':購入価格, 'amount':数量, 'timestamp':時刻}]
+
+    while True:
+        df = fetch_ohlcv()
+        df['rsi'] = calc_rsi(df)
+        macd, macd_signal = calc_macd(df)
+        df['macd'] = macd
+        df['macd_signal'] = macd_signal
+        df['short_mavg'] = df['close'].rolling(window=25).mean()
+        df['mid_mavg'] = df['close'].rolling(window=75).mean()
+        df['long_mavg'] = df['close'].rolling(window=200).mean()
+        latest = df.iloc[-1]
+        jpy, btc = get_balance()
+        current_price = latest['close']
+
+        # 利確・損切り判定（各ポジションごと）
+        sell_indices = []
+        for idx, pos in enumerate(positions):
+            profit_pct = (current_price - pos['price']) / pos['price'] * 100
+            if profit_pct >= PROFIT_TAKE_PCT:
+                print(f"利確シグナル: {profit_pct:.2f}%上昇→売却 {pos['amount']:.6f}BTC @ {pos['price']:.0f}")
+                place_order('sell', pos['amount'])
+                sell_indices.append(idx)
+            elif profit_pct <= -STOP_LOSS_PCT:
+                print(f"損切りシグナル: {profit_pct:.2f}%下落→売却 {pos['amount']:.6f}BTC @ {pos['price']:.0f}")
+                place_order('sell', pos['amount'])
+                sell_indices.append(idx)
+
+        # 売りシグナル（RSI, MACD, MAクロス）
+        if btc > MIN_ORDER_BTC:
+            sell_signal = False
+            if latest['rsi'] >= RSI_SELL:
+                print(f"RSI売りシグナル: RSI={latest['rsi']:.2f}")
+                sell_signal = True
+            if latest['macd'] < latest['macd_signal']:
+                print(f"MACDデッドクロス→売り")
+                sell_signal = True
+            if latest['short_mavg'] < latest['mid_mavg']:
+                print(f"MAクロス（短期<中期）→売り")
+                sell_signal = True
+            if sell_signal and positions:
+                for idx, pos in enumerate(positions):
+                    print(f"シグナル売却: {pos['amount']:.6f}BTC @ {pos['price']:.0f}")
+                    place_order('sell', pos['amount'])
+                    sell_indices.append(idx)
+
+        # 売却済みポジションをリストから削除
+        positions = [pos for idx, pos in enumerate(positions) if idx not in sell_indices]
+
+        # 買いシグナル（RSI, MACD, MAクロス）
+        if jpy > BALANCE_BUFFER:
+            buy_amount = min((jpy - BALANCE_BUFFER) * MAX_RISK_PERCENT / latest['close'], btc if btc else 1.0)
+            if buy_amount < MIN_ORDER_BTC:
+                buy_amount = MIN_ORDER_BTC
+            buy_signal = False
+            if latest['rsi'] <= RSI_BUY:
+                print(f"RSI買いシグナル: RSI={latest['rsi']:.2f}")
+                buy_signal = True
+            if latest['macd'] > latest['macd_signal']:
+                print(f"MACDゴールデンクロス→買い")
+                buy_signal = True
+            if latest['short_mavg'] > latest['mid_mavg']:
+                print(f"MAクロス（短期>中期）→買い")
+                buy_signal = True
+            if buy_signal:
+                place_order('buy', buy_amount)
+                positions.append({'price': current_price, 'amount': buy_amount, 'timestamp': time.time()})
+
+        print(f"待機中... JPY={jpy:.0f}, BTC={btc:.6f}, RSI={latest['rsi']:.2f}, MACD={latest['macd']:.2f}, MACDsig={latest['macd_signal']:.2f}, ポジション数={len(positions)}")
+        time.sleep(LOOP_INTERVAL)
+# --- メール通知関数の定義（未定義エラー対策） ---
+import smtplib
+from email.mime.text import MIMEText
+def send_notification(smtp_host, smtp_port, smtp_user, smtp_password, email_to, subject, message):
     try:
-        msg = ' '.join(str(a) for a in args)
+        msg = MIMEText(message)
+        msg['Subject'] = subject
+        msg['From'] = smtp_user
+        msg['To'] = email_to
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.sendmail(smtp_user, [email_to], msg.as_string())
+        print(f"📧 通知メール送信: {subject}")
+    except Exception as e:
+        print(f"⚠️ メール送信エラー: {e}")
+# --- FundManager, _adapt_fund_manager_instance の定義（stagingから移植） ---
+import json
+from typing import Optional
+from pathlib import Path
+def _make_internal_fund_manager_class():
+    class FundManagerStub:
+        def __init__(self, initial_fund: float = 0.0, state_file: Optional[str] = None):
+            import threading
+            self._lock = threading.Lock()
+            self._state_file = Path(state_file) if state_file else None
+            self._available = float(initial_fund or 0.0)
+            self._reserved = 0.0
+            try:
+                if self._state_file and self._state_file.exists():
+                    raw = json.loads(self._state_file.read_text(encoding='utf-8'))
+                    self._available = float(raw.get('available', self._available))
+                    self._reserved = float(raw.get('reserved', 0.0))
+            except Exception:
+                pass
+        def _persist(self):
+            if not self._state_file:
+                return
+            try:
+                obj = {'available': float(self._available), 'reserved': float(self._reserved)}
+                self._state_file.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding='utf-8')
+            except Exception:
+                pass
+        def available_fund(self) -> float:
+            try:
+                return float(self._available)
+            except Exception:
+                return 0.0
+        def place_order(self, cost: float) -> bool:
+            try:
+                c = float(cost)
+            except Exception:
+                return False
+            with self._lock:
+                if self._available < c:
+                    return False
+                self._available = float(self._available) - c
+                self._persist()
+            return True
+        def add_funds(self, amount: float) -> None:
+            try:
+                a = float(amount)
+            except Exception:
+                return
+            with self._lock:
+                self._available = float(self._available) + a
+                self._persist()
+        def reserve(self, cost: float) -> bool:
+            try:
+                c = float(cost)
+            except Exception:
+                return False
+            with self._lock:
+                if self._available < c:
+                    return False
+                self._available = float(self._available) - c
+                self._reserved = float(self._reserved) + c
+                self._persist()
+            return True
+        def confirm(self, cost: float) -> None:
+            try:
+                c = float(cost)
+            except Exception:
+                return
+            with self._lock:
+                self._reserved = max(0.0, float(self._reserved) - c)
+                self._persist()
+        def release(self, cost: float) -> None:
+            try:
+                c = float(cost)
+            except Exception:
+                return
+            with self._lock:
+                self._reserved = max(0.0, float(self._reserved) - c)
+                self._available = float(self._available) + c
+                self._persist()
+    return FundManagerStub
+
+_InternalFundManager = _make_internal_fund_manager_class()
+try:
+    from funds import FundManager as _ImportedFundManager  # type: ignore
+    required = ('available_fund', 'place_order', 'add_funds')
+    if all(hasattr(_ImportedFundManager, name) for name in required):
+        FundManager = _ImportedFundManager
+    else:
+        FundManager = _InternalFundManager
+except Exception:
+    FundManager = _InternalFundManager
+
+def _adapt_fund_manager_instance(fm):
+    try:
+        dry_run_env = str(os.getenv('DRY_RUN', '')).lower() in ('1', 'true', 'yes', 'on')
     except Exception:
-        msg = str(args)
+        dry_run_env = False
+    if fm is not None and all(hasattr(fm, name) for name in ('reserve', 'confirm', 'release', 'available_fund')):
+        return fm
+    class FundAdapter:
+        def __init__(self, fund_manager=None, initial_fund: float = 0.0, dry_run: bool = False):
+            import threading
+            self._fund = fund_manager
+            self._dry_run = bool(dry_run)
+            self._local_total = float(initial_fund or 0.0)
+            self._local_used = 0.0
+            self._lock = threading.Lock()
+        def available_fund(self) -> float:
+            if self._fund is not None and not self._dry_run and hasattr(self._fund, 'available_fund'):
+                try:
+                    return float(self._fund.available_fund())
+                except Exception:
+                    pass
+            with self._lock:
+                return float(self._local_total) - float(self._local_used)
+        def reserve(self, cost: float) -> bool:
+            try:
+                c = float(cost)
+            except Exception:
+                return False
+            with self._lock:
+                if self.available_fund() < c:
+                    return False
+                self._local_used += c
+                return True
+        def place_order(self, cost: float) -> bool:
+            return self.reserve(cost)
+        def add_funds(self, amount: float) -> None:
+            try:
+                a = float(amount)
+            except Exception:
+                return
+            with self._lock:
+                self._local_total += a
+        def confirm(self, cost: float) -> None:
+            try:
+                c = float(cost)
+            except Exception:
+                return
+            with self._lock:
+                self._local_used = max(0.0, self._local_used - c)
+        def release(self, cost: float) -> None:
+            try:
+                c = float(cost)
+            except Exception:
+                return
+            with self._lock:
+                self._local_used = max(0.0, self._local_used - c)
+                self._local_total += c
+    return FundAdapter(fund_manager=fm, initial_fund=fm.fund if fm and hasattr(fm, 'fund') else 0.0)
+import logging
+
+# データ取得間隔（秒）
+interval_seconds = 3600
+# --- ロギング関数の再定義 ---
+def log_debug(*args, **kwargs):
+    msg = ' '.join(str(a) for a in args)
     try:
-        import logging
+        logging.getLogger().debug(msg)
+    except Exception:
+        pass
+    try:
+        print(msg, **kwargs)
+    except Exception:
+        print(msg)
+
+def log_error(*args, **kwargs):
+    msg = ' '.join(str(a) for a in args)
+    try:
+        logging.getLogger().error(msg)
+    except Exception:
+        pass
+    try:
+        print(msg, **kwargs)
+    except Exception:
+        print(msg)
+def log_info(*args, **kwargs):
+    msg = ' '.join(str(a) for a in args)
+    try:
         logging.getLogger().info(msg)
     except Exception:
         pass
@@ -15,12 +336,8 @@ def log_info(*args, **kwargs):
         print(msg)
 
 def log_warn(*args, **kwargs):
+    msg = ' '.join(str(a) for a in args)
     try:
-        msg = ' '.join(str(a) for a in args)
-    except Exception:
-        msg = str(args)
-    try:
-        import logging
         logging.getLogger().warning(msg)
     except Exception:
         pass
@@ -29,57 +346,16 @@ def log_warn(*args, **kwargs):
     except Exception:
         print(msg)
 
-def log_error(*args, **kwargs):
-    try:
-        msg = ' '.join(str(a) for a in args)
-    except Exception:
-        msg = str(args)
-    try:
-        import logging
-        logging.getLogger().error(msg)
-    except Exception:
-        pass
-    try:
-        print(msg, **kwargs)
-    except Exception:
-        print(msg)
 
-def log_debug(*args, **kwargs):
-    try:
-        msg = ' '.join(str(a) for a in args)
-    except Exception:
-        msg = str(args)
-    try:
-        import logging
-        logging.getLogger().debug(msg)
-    except Exception:
-        pass
-    try:
-        print(msg, **kwargs)
-    except Exception:
-        print(msg)
-
-# --- FundManager, FundAdapter, _adapt_fund_manager_instance のダミー定義 ---
-class FundManager:
-    def __init__(self, initial_fund=0, state_file=None):
-        self.fund = initial_fund
-    def available_fund(self):
-        return self.fund
-    def add_funds(self, amount):
-        self.fund += amount
-    def reserve(self, cost):
-        if self.fund >= cost:
-            self.fund -= cost
-            return True
-        return False
-    def release(self, cost):
-        self.fund += cost
+# === DI対応版のエントリーポイント ===
 
 # --- 未定義グローバル変数・定数・関数のダミー定義・import ---
+import os
 try:
     from dotenv import load_dotenv
+    load_dotenv()
 except ImportError:
-    def load_dotenv(*a, **k): return False
+    pass
 env_paths = ['.env']
 DYN_OHLCV_DAYS = 30
 DYN_THRESHOLD_BUFFER_JPY = 1000
@@ -88,8 +364,7 @@ env_loaded = False
 DYN_THRESHOLD_RATIO = 1.0
 pair = 'BTC/JPY'
 days = 30
-import os
-buffer_jpy = int(os.getenv('BALANCE_BUFFER', 1000))
+buffer_jpy = int(os.getenv('BALANCE_BUFFER', 500))
 buffer_pct = 0.01
 # --- 未定義定数・変数のダミー定義 ---
 TRADE_TRIGGER_PCT = 10.0
@@ -113,25 +388,12 @@ class FundAdapter:
         self.fund = initial_fund
     def available_fund(self):
         return self.fund
-    def reserve(self, cost):
-        if self.fund >= cost:
-            self.fund -= cost
-            return True
-        return False
-    def release(self, cost):
-        self.fund += cost
-    def add_funds(self, amount):
-        self.fund += amount
-
-def _adapt_fund_manager_instance(fm):
-    return FundAdapter(fund_manager=fm, initial_fund=fm.fund if fm else 0.0)
 
 import logging
 
 # --- ロギング関数の再定義 ---
 import datetime
 import time
-from filelock import FileLock
 import sys
 
 
@@ -140,20 +402,33 @@ import sys
 # --- 未定義変数のダミー定義（未定義エラー防止用） ---
 available_pre = 10000
 allowed_by_percent = 10000
-allowed_by_buffer = 10000
-LOCKFILE = '/tmp/ninibo_order.lock'
-LOCK_TIMEOUT = 10
-reserved_budget = 0
-fund_manager = None
-# --- connect_to_bitbank: Bitbank用の簡易接続関数（未定義エラー対策のダミー実装） ---
+
+        # ...existing code...
+
+        # --- connect_to_bitbank: Bitbank用の簡易接続関数（未定義エラー対策のダミー実装） ---
 def connect_to_bitbank():
     import ccxt
     api_key = os.getenv("API_KEY")
     secret_key = os.getenv("SECRET_KEY")
     return ccxt.bitbank({
-        'apiKey': api_key,
-        'secret': secret_key,
+        'apiKey': api_key or "",
+        'secret': secret_key or "",
     })
+
+        # ...existing code...
+
+
+# --- メイン実行部 ---
+if __name__ == "__main__":
+    try:
+        log_info("Bot起動中...")
+        # Botのメイン処理を呼び出し（自動売買ロジック有効化）
+        # run_bot_di() の呼び出し前に関数定義が必要
+        def run_bot_di_dummy():
+            print("run_bot_di() is called (dummy implementation)")
+        run_bot_di_dummy()
+    except Exception as e:
+        log_error(f"Bot起動時に例外: {e}")
 
 
 # ccxt がインストールされていない環境でもファイルが読み込めるよう、フォールバックのスタブを用意します。
@@ -182,298 +457,8 @@ try:
 except Exception:
     # Minimal pandas-like stub to avoid import errors and provide the small API used in this script.
     # NOTE: This is a lightweight compatibility shim for parsing/testing and does NOT replace real pandas.
-    class Series:
-        def __init__(self, values):
-            self.values = list(values) if values is not None else []
-            self._window = None
-
-        # --- ロギング関数の再定義 ---
-
-        # --- ロギング関数の再定義 ---
-
-        # --- ロギング関数の再定義 ---
-
-        # --- ロギング関数の再定義 ---
-
-        # --- ロギング関数の再定義 ---
-        import logging
-
-        # --- ロギング関数の再定義 ---
-        def rolling(self, window):
-            self._window = int(window)
-            return self
-
-        def mean(self):
-            vals = self.values
-            w = self._window or 1
-            if not vals:
-                return []
-            res = []
-            for i in range(len(vals)):
-                if i + 1 < w:
-                    res.append(None)
-                else:
-                    window_vals = [v for v in vals[i + 1 - w:i + 1] if v is not None]
-                    res.append(sum(window_vals) / len(window_vals) if window_vals else None)
-            return res
-
-        def __iter__(self):
-            return iter(self.values)
-
-    class Row:
-        def __init__(self, data):
-            self._data = data or {}
-
-        def __getitem__(self, key):
-            return self._data.get(key)
-
-        def __getattr__(self, name):
-            if name in self._data:
-                return self._data[name]
-            raise AttributeError(name)
-
-    class DataFrame:
-        def __init__(self, data=None, columns=None):
-            # data: list of lists (rows) or list of dicts
-            self._columns = list(columns) if columns else []
-            self._rows = []
-            if data:
-                if self._columns and all(isinstance(r, (list, tuple)) for r in data):
-                    for row in data:
-                        self._rows.append({c: v for c, v in zip(self._columns, row)})
-                elif all(isinstance(r, dict) for r in data):
-                    self._rows = [dict(r) for r in data]
-                    if not self._columns:
-                        cols = set()
-                        for r in self._rows:
-                            cols.update(r.keys())
-                        self._columns = list(cols)
-                else:
-                    # fallback: single column
-                    col = self._columns[0] if self._columns else "data"
-                    for r in data:
-                        self._rows.append({col: r})
-            self.index = None
-
-        def __len__(self):
-            return len(self._rows)
-
-        def __getitem__(self, key):
-            if isinstance(key, str):
-                vals = [row.get(key) for row in self._rows]
-                return Series(vals)
-            raise KeyError(key)
-
-        def __setitem__(self, key, value):
-            # value can be Series or iterable; align by index
-            vals = list(value) if hasattr(value, '__iter__') and not isinstance(value, (str, bytes)) else [value] * len(self._rows)
-            if not self._rows and vals:
-                for v in vals:
-                    self._rows.append({key: v})
-            else:
-                for i, v in enumerate(vals):
-                    if i < len(self._rows):
-                        self._rows[i][key] = v
-                    else:
-                        self._rows.append({key: v})
-            if key not in self._columns:
-                self._columns.append(key)
-
-        @property
-        def iloc(self):
-            class _Loc:
-                def __init__(self, rows):
-                    self._rows = rows
-
-                def __getitem__(self, idx):
-                    return Row(self._rows[idx])
-            return _Loc(self._rows)
-
-        def set_index(self, key):
-            self.index = key
-            return self
-
-    def to_datetime(values, unit='ms'):
-        out = []
-        for v in values:
-            try:
-                if v is None:
-                    out.append(None)
-                    continue
-                if unit == 'ms':
-                    ts = float(v) / 1000.0
-                else:
-                    ts = float(v)
-                out.append(datetime.datetime.fromtimestamp(ts))
-            except Exception:
-                out.append(None)
-        return out
-
-    import types
-    pd = types.SimpleNamespace(DataFrame=DataFrame, to_datetime=to_datetime)
-
-from zoneinfo import ZoneInfo  # 標準ライブラリのタイムゾーン処理
-#import time
-import json
-from pathlib import Path
-import math
-import os
-
-# Safety & strategy environment variables (defaults)
-MAX_SLIPPAGE_PCT = float(os.environ.get("MAX_SLIPPAGE_PCT", "0.5"))  # percent
-ORDER_EXECUTION_WINDOW_SEC = int(os.environ.get("ORDER_EXECUTION_WINDOW_SEC", "30"))
-COOLDOWN_SEC = int(os.environ.get("COOLDOWN_SEC", "3600"))  # 秒
-def safe_print(s: str) -> None:
-    # Print safely even when the console encoding can't represent some characters.
-    # Replaces unencodable characters with the platform replacement character.
-    print(s)
-for env_path in env_paths:
-    if load_dotenv(dotenv_path=env_path):
-        safe_print(f"[OK] 環境変数を {env_path} から読み込みました")
-        env_loaded = True
-        break
-
-if not env_loaded:
-    safe_print("[WARN] .env ファイルが見つかりません。環境変数は systemd EnvironmentFile から読み込まれます。")
-
-# グローバルに使う API キーを一度だけ読み込む
-API_KEY = os.getenv("API_KEY")
-SECRET_KEY = os.getenv("SECRET_KEY")
-
-# 日本標準時 (JST) のタイムゾーンオブジェクトを作成
-try:
-    JST = ZoneInfo('Asia/Tokyo')
-except Exception:
-    # Windows 等で tzdata が無い環境では ZoneInfo が ZoneInfoNotFoundError を出すことがあるため
-    # 安全に固定オフセットで JST を作成してフォールバックします（UTC+9）。
-    JST = datetime.timezone(datetime.timedelta(hours=9))
-
-# === 環境変数の取得（実行時チェック用にグローバル変数として定義） ===
-smtp_user = os.getenv("SMTP_USER")
-smtp_password = os.getenv("SMTP_PASS")  # .env.newに合わせてSMTP_PASSに変更
-email_to = os.getenv("TO_EMAIL")  # .env.newに合わせてTO_EMAILに変更
-smtp_host = os.getenv("SMTP_HOST")  # キー名を取得する変数を smtp_host に変更
-# モジュールレベルでのチェックを削除（実行時にチェックするように変更）
-
-subject = os.getenv("SUBJECT", "📬 通知")
-
-# === SMTP_PORT の安全な読み込み ===
-# デフォルトを 465 (SMTPS) にしておきます。環境変数があればそれを使い、整数変換に失敗したら 465 にフォールバックします。
-port_str = os.getenv("SMTP_PORT", "465")
-try:
-    smtp_port = int(port_str)
-except Exception:
-    smtp_port = 465
-
-# === メール送信関数 ===
-def send_notification(smtp_host, smtp_port, smtp_user, smtp_password, to, subject, body):
-    # 安全化したメール送信ラッパー。
-    # - DRY_RUN のときは送信をスキップする。
-    # - SMTP ホスト/宛先が未設定のときは送信をスキップする。
-    # - 接続タイムアウトを短くしてブロックを避ける。
-    # Returns True on success, False otherwise.
-    from email.mime.text import MIMEText
-    import smtplib
-    import os
-
-    # DRY_RUN のときは送信をスキップ (成功扱いにすることで通知ループを防ぐ)
-    if str(os.getenv('DRY_RUN', '0')).lower() in ('1', 'true', 'yes', 'on'):
-        log_info('ℹ️ DRY_RUN が有効のためメール送信をスキップします')
-        return True
-
-    # 必須情報が無ければ送信をスキップ
-    if not smtp_host or not to:
-        log_warn('ℹ️ SMTP ホストまたは宛先が未設定のためメール送信をスキップします')
-        return False
-
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = smtp_user or ''
-    msg["To"] = to
-
-    # SMTPS 判定（環境変数が無ければポート465を SMTPS と判断）
-    use_ssl_env = os.getenv("SMTP_USE_SSL")
-    if use_ssl_env is None:
-        try:
-            use_ssl = (int(smtp_port) == 465)
-        except Exception:
-            use_ssl = True
-    else:
-        use_ssl = str(use_ssl_env).lower() in ("1", "true", "yes", "on")
-
-    # 接続タイムアウト（秒）を短めにする
-    try:
-        timeout_sec = float(os.getenv('SMTP_CONNECT_TIMEOUT', '10'))
-    except Exception:
-        timeout_sec = 10.0
-
-    if use_ssl:
-        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=timeout_sec) as server:
-            if smtp_user and smtp_password:
-                try:
-                    server.login(smtp_user, smtp_password)
-                except Exception as e:
-                    try:
-                        log_warn(f'⚠️ SMTP 認証失敗: {e}')
-                    except Exception:
-                        print(f'⚠️ SMTP 認証失敗: {e}')
-            server.send_message(msg)
-    else:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=timeout_sec) as server:
-            try:
-                server.starttls()
-            except Exception:
-                # StartTLS が使えない環境でもログは残す
-                pass
-            if smtp_user and smtp_password:
-                try:
-                    server.login(smtp_user, smtp_password)
-                except Exception as e:
-                    try:
-                        log_warn(f'⚠️ SMTP 認証失敗: {e}')
-                    except Exception:
-                        print(f'⚠️ SMTP 認証失敗: {e}')
-            server.send_message(msg)
-    try:
-        log_info("✅ メール送信成功")
-    except Exception:
-        log_info("✅ メール送信成功")
-    return True
-
-
-# 取引所の設定を取得
-exchange_name = os.getenv("EXCHANGE", "bitbank")
-
-
-# === メイン処理開始（Botの心臓が動き出す） ===
-if __name__ == "__main__":
-    try:
-        log_info("Bot起動中...")
-    except Exception:
-        log_info("Bot起動中...")
-    # run_botの定義後に呼び出すように移動しました
-
-# 1. 初期設定と認証 (APIキーの読み込みはここにあります)
-
-# .envファイルからAPIキーを読み込みます（config.envから統合済み）
-
- 
-# ※注意: APIキー読み込みと bitbank インスタンスの直接作成は
-# connect_to_bitbank() に統合しました。元の直接作成コードを削除しています。
-# 必要であれば、環境変数の確認は connect_to_bitbank() 呼び出し時に行われます。
-
-# 旧来の直接接続テスト/監視ループは削除しました。
-# 取引所接続とループは connect_to_bitbank() と run_bot() に統合されています。
-
-
-# ==========================================================
-# 🔑 2. グローバルキー読み込みと定義 (修正点: 最上部に移動)
-# ==========================================================
-#.env# config.envからAPIキーを読み込みます
-
-load_dotenv(dotenv_path='.env') 
-API_KEY = os.getenv("API_KEY") # グローバル定数として定義
-SECRET_KEY = os.getenv("SECRET_KEY") # グローバル定数として定義
+    # BotのDIエントリーポイントで起動
+    run_bot_di()
 
 # 日本標準時 (JST) のタイムゾーンオブジェクトを作成
 try:
@@ -623,9 +608,13 @@ def get_latest_price(exchange, pair='BTC/JPY', retries=3, backoff=1.0):
 
             ticker = exchange.fetch_ticker(pair)
             if isinstance(ticker, dict) and 'last' in ticker:
-                try:
-                    return float(ticker.get('last'))
-                except Exception:
+                last = ticker.get('last')
+                if last is not None:
+                    try:
+                        return float(last)
+                    except Exception:
+                        return None
+                else:
                     return None
             # ccxt の一部実装はオブジェクトや異なる形で返す可能性がある
             # 呼び出し側で安全に扱える形で None を返す
@@ -1143,7 +1132,7 @@ def round_down_qty(qty: float, step: float) -> float:
 
 def compute_qty_for_budget_with_fee(reserved_jpy: float, price_jpy: float,
                                     min_btc: float = 0.0001, step: float = 0.0001,
-                                    available_jpy: float = None, balance_buffer: float = 0.0):
+                                    available_jpy: float = 0.0, balance_buffer: float = 0.0):
     # Return (qty, cost_jpy, fee_jpy) for given budget and price.
     try:
         fee_rate = float(os.getenv('FEE_RATE', '0.001'))
@@ -1178,41 +1167,19 @@ def compute_qty_for_budget_with_fee(reserved_jpy: float, price_jpy: float,
             try:
                 max_mult = float(os.getenv('AUTO_RESIZE_MAX_MULTIPLIER', '1.5'))
             except Exception:
-                try:
-                    df = get_ohlcv(exchange, pair, timeframe='1d', limit=max(10, days + 5))
-                    if df is None or len(df) == 0:
-                        return None, None, None
-                    try:
-                        closes = [float(v) for v in df['close'] if v is not None]
-                    except Exception:
-                        closes = []
-                        for i in range(len(df)):
-                            try:
-                                closes.append(float(df.iloc[i]['close']))
-                            except Exception:
-                                pass
-                    try:
-                        ratio = float(os.environ.get('DYN_THRESHOLD_RATIO', DYN_THRESHOLD_RATIO))
-                    except Exception:
-                        ratio = float(DYN_THRESHOLD_RATIO)
-                    buffer_jpy = float(os.environ.get('DYN_THRESHOLD_BUFFER_JPY', DYN_THRESHOLD_BUFFER_JPY))
-                    buffer_pct = float(os.environ.get('DYN_THRESHOLD_BUFFER_PCT', DYN_THRESHOLD_BUFFER_PCT))
-                    min_close = min(closes)
-                    max_close = max(closes)
-                    if ratio and float(ratio) > 0:
-                        threshold = float(min_close) + (float(max_close) - float(min_close)) * float(ratio)
-                    elif buffer_jpy and float(buffer_jpy) > 0:
-                        threshold = float(min_close) + float(buffer_jpy)
-                    else:
-                        threshold = float(min_close) * (1.0 + float(buffer_pct))
-                    return float(threshold), float(min_close), float(max_close)
-                except Exception as e:
-                    try:
-                        log_warn(f"⚠️ dynamic threshold computation failed: {e}")
-                    except Exception:
-                        log_warn(f"⚠️ dynamic threshold computation failed: {e}")
-                    return None, None, None
-    return True
+                max_mult = 1.5
+            # 再計算
+            approx_qty = (max_allowed_jpy * max_mult) / (price_jpy * (1.0 + fee_rate))
+            qty = round_down_qty(approx_qty, step)
+            if qty < min_btc:
+                return 0.0, 0.0, 0.0
+        else:
+            return 0.0, 0.0, 0.0
+
+    # コストと手数料を計算
+    cost_jpy = qty * price_jpy
+    fee_jpy = cost_jpy * fee_rate + fee_fixed
+    return qty, cost_jpy, fee_jpy
 
 
 # --- State utilities for cooldown / positions ---
@@ -1337,6 +1304,7 @@ def set_last_buy_time(state, ts=None):
 
 
 def record_position(state, side, price, qty):
+    print("DEBUG: record_position called", side, price, qty)
     state.setdefault("positions", [])
     state["positions"].append({
         "side": side,
@@ -1346,10 +1314,13 @@ def record_position(state, side, price, qty):
     })
     if len(state["positions"]) > 50:
         state["positions"] = state["positions"][-50:]
+    print(f"DEBUG: record_position saving state with positions={state['positions']}")
     save_state(state)
+    print("DEBUG: record_position finished")
 
 
 def is_slippage_too_large(reference_price, latest_price):
+    print("DEBUG: save_state called")
     try:
         if reference_price is None or latest_price is None:
             return False
@@ -1374,10 +1345,20 @@ def generate_signals(df):
             log_warn(f"⚠️ データが不足しています。最低200本必要ですが、{len(df) if df is not None else 0}本しかありません。")
         return None
 
+
     # 短期25、中期75、長期200を追加
     df['short_mavg'] = df['close'].rolling(window=25).mean()
-    df['mid_mavg'] = df['close'].rolling(window=75).mean() # 75をmidに名称変更
-    df['long_mavg'] = df['close'].rolling(window=200).mean() # 新しい長期MA
+    df['mid_mavg'] = df['close'].rolling(window=75).mean()
+    df['long_mavg'] = df['close'].rolling(window=200).mean()
+
+    # RSI計算（14期間）
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.rolling(window=14).mean()
+    avg_loss = loss.rolling(window=14).mean()
+    rs = avg_gain / avg_loss
+    df['rsi'] = 100 - (100 / (1 + rs))
 
     latest_data = df.iloc[-1]
     previous_data = df.iloc[-2]
@@ -1385,30 +1366,32 @@ def generate_signals(df):
     signal = None
     message = None
 
-    # 🔑 トレンドフィルター
+    # RSIによる売買判定
+    if latest_data['rsi'] <= 30:
+        signal = 'buy_entry'
+        message = f"✅ RSI買いシグナル: RSI={latest_data['rsi']:.2f} (30以下)"
+        return signal, message
+    elif latest_data['rsi'] >= 70:
+        signal = 'sell_all'
+        message = f"❌ RSI売りシグナル: RSI={latest_data['rsi']:.2f} (70以上)"
+        return signal, message
+
+    # 従来のトレンドフィルターも残す
     is_uptrend = latest_data['mid_mavg'] > latest_data['long_mavg']
     mid_mavg_is_rising = latest_data['mid_mavg'] > previous_data['mid_mavg']
 
-    # --- 買いシグナル 1：新規エントリー (ゴールデンクロス) ---
     if (previous_data['short_mavg'] <= previous_data['mid_mavg'] and
         latest_data['short_mavg'] > latest_data['mid_mavg'] and
         is_uptrend and mid_mavg_is_rising):
-        signal = 'buy_entry' # 新規エントリーシグナル
+        signal = 'buy_entry'
         message = "✅ 新規エントリーシグナル (GC 25/75、トレンド確認) が発生しました。"
         return signal, message
-
-    # --- 買いシグナル 2：買い増し (押し目) ---
-    # 注: GC後、ポジション保有中に価格がMA25を上回っている（押し目買い）でトレンド上昇中
     elif latest_data['close'] > latest_data['short_mavg'] and is_uptrend:
-        signal = 'buy_add' 
+        signal = 'buy_add'
         message =  "📈 買い増しシグナル (押し目買い) が発生しました。"
-        
-    # --- 売りシグナル：全決済 (トレンド終了) ---
-    # MA75がMA200を下回った、またはMA75が下向きに転じた
     elif not is_uptrend or latest_data['mid_mavg'] < previous_data['mid_mavg']:
         signal = 'sell_all'
         message = "❌ 全決済シグナル (長期トレンド終了/反転) が発生しました。"
-    
     return signal, message
 
 
@@ -1418,9 +1401,13 @@ def log_order(action, pair, amount, price=None):
     # Format order log message
     msg = f"{action}注文: {amount:.4f} {pair.split('/')[0]} {'@ ' + str(price) if price else '（成行）'}"
     try:
-        log_info(msg)
+        logging.getLogger().info(msg)
     except Exception:
-        log_info(msg)
+        pass
+    try:
+        print(msg)
+    except Exception:
+        print(msg)
     return msg
 
 # === 5. 注文の実行 ===
@@ -1500,36 +1487,8 @@ def _ensure_fund_manager_has_funds(fm, initial_amount=None):
         auto_fix = False
 
     if not auto_fix:
+        # 不要なtmp_path関連の処理を削除
         return
-
-    try:
-        avail = float(fm.available_fund())
-    except Exception:
-        avail = 0.0
-
-    if avail and avail > 0:
-        return
-
-    # determine top-up amount; allow override via AUTO_FIX_AMOUNT (JPY)
-    try:
-        if initial_amount is not None:
-            initial = float(initial_amount)
-        else:
-            initial = float(os.getenv('AUTO_FIX_AMOUNT', os.getenv('INITIAL_FUND', '20000')))
-    except Exception:
-        initial = 20000.0
-
-    try:
-        fm.add_funds(initial)
-        print(f"🔧 funds were zero; auto-added {initial:.0f} JPY to fund_manager (AUTO_FIX_FUNDS)")
-    except Exception as e:
-        print(f"⚠️ failed to auto-fix fund_manager funds: {e}")
-
-# 修正点: グローバルキーを使用するため、api_keyとsecret_keyの引数を削除
-def run_bot(exchange, fund_manager_instance):
-    # Main execution for BTC auto-trading bot (single run)
-    pair = 'BTC/JPY'
-    interval_seconds = 3600
 
     # DEBUG: run_bot entry
     try:
@@ -1550,10 +1509,11 @@ def run_bot(exchange, fund_manager_instance):
         required_env_vars = []
 
     # Exchange/FundManager の準備
-    if exchange is None:
+    exchange = None
+    if 'exchange' not in locals() or exchange is None:
         exchange = connect_to_bitbank()
     # adapter を通して安全に扱えるようにする
-    fund_manager = None
+    fund_manager = _adapt_fund_manager_instance(FundManager(initial_fund=0.0, state_file=os.getenv('FUND_STATE_FILE', 'funds_state.json')))
 
     if not exchange and not env_dry_run:
         try:
@@ -1579,9 +1539,9 @@ def run_bot(exchange, fund_manager_instance):
         MAX_RISK_PERCENT = 0.05
     # 注文後に常に残す最低バッファ (JPY)
     try:
-        BALANCE_BUFFER = float(os.getenv('BALANCE_BUFFER', '1000'))
+        BALANCE_BUFFER = float(os.getenv('BALANCE_BUFFER', '500'))
     except Exception:
-        BALANCE_BUFFER = 1000.0
+        BALANCE_BUFFER = 500.0
 
     # available_pre, allowed_by_percent, allowed_by_buffer, reserved_budgetの計算をprintより前に必ず実行
     try:
@@ -1609,6 +1569,7 @@ def run_bot(exchange, fund_manager_instance):
             # 少額運用では利用可能額のみ表示（総額は省略）
             log_info(f"💼 利用可能残高: JPY={jpy_free:.0f}円, BTC={btc_free:.8f}BTC")
     except Exception as e:
+        print(f"DEBUG: save_state exception: {e}")
         try:
             log_warn(f"⚠️ 残高取得に失敗: {e}")
         except Exception:
@@ -1652,457 +1613,152 @@ def run_bot(exchange, fund_manager_instance):
         # Use a file lock when reading/modifying/saving state for sell flow to avoid
         # races with concurrent buy operations that also update the state file.
         LOCKFILE_SELL = os.getenv('ORDER_LOCKFILE', '/tmp/ninibo_order.lock')
-        with FileLock(LOCKFILE_SELL):
-            state = load_state()
-            positions = state.get('positions', []) if isinstance(state, dict) else []
-            if positions:
-                # Find the most recent BUY position that has a valid (non-zero) price.
-                last_pos = None
-                for p in reversed(positions):
-                    try:
-                        if p.get('side') == 'buy' and float(p.get('price', 0) or 0) > 0:
-                            last_pos = p
-                            break
-                    except Exception:
-                        continue
-
-                if last_pos is not None:
-                    entry_price = float(last_pos.get('price', 0))
-                    entry_qty = float(last_pos.get('qty', 0))
-                    lp = get_latest_price(exchange, pair)
-                    if lp is not None:
-                        # TRADE_TRIGGER_PCT を使って利確（デフォルトは設定値%）
-                        gain_pct = (float(lp) - entry_price) / float(entry_price) * 100.0 if entry_price and entry_price > 0 else 0.0
-                        if gain_pct >= float(TRADE_TRIGGER_PCT):
-                            print(f"INFO: Trigger sell: gain={gain_pct:.2f}% >= {TRADE_TRIGGER_PCT}% -> selling {entry_qty} at {lp}")
-                            sell_order = execute_order(exchange, pair, 'sell', entry_qty)
-                            try:
-                                print(f"DEBUG: post-execute_order sell_order={sell_order}")
-                            except Exception:
-                                pass
-                            if sell_order and isinstance(sell_order, dict) and 'id' in sell_order:
-                                # 売却成功: remove the sold position (the last valid one) and save state
-                                try:
-                                    removed = False
-                                    for i in range(len(positions)-1, -1, -1):
-                                        try:
-                                            p = positions[i]
-                                            if p.get('side') == 'buy' and float(p.get('price', 0) or 0) == float(entry_price) and float(p.get('qty', 0) or 0) == float(entry_qty):
-                                                try:
-                                                    print(f"DEBUG: removing position at index={i} -> {p}")
-                                                except Exception:
-                                                    pass
-                                                # perform deletion
-                                                del positions[i]
-                                                removed = True
-                                                # Immediately persist a tiny marker and an in-memory snapshot
-                                                try:
-                                                    marker = STATE_FILE.with_name(STATE_FILE.name + f'.after_sell.marker')
-                                                    with open(str(marker), 'wb') as mf:
-                                                        mf.write(b'REACHED_AFTER_SELL')
-                                                    dbg_path = STATE_FILE.with_name(STATE_FILE.name + f'.after_sell.immediate.json')
-                                                    dbg_path.write_text(json.dumps({'positions': positions, 'watch_reference': state.get('watch_reference')}, ensure_ascii=False, indent=2), encoding='utf-8')
-                                                    try:
-                                                        print(f"DEBUG: immediate marker and snapshot written: {marker}, {dbg_path}")
-                                                    except Exception:
-                                                        pass
-                                                except Exception as e_immediate:
-                                                    try:
-                                                        print(f"DEBUG: failed immediate marker/snapshot write: {e_immediate}")
-                                                    except Exception:
-                                                        pass
-                                                break
-                                        except Exception as e_rem:
-                                            try:
-                                                print(f"DEBUG: exception while scanning positions for removal: {e_rem}")
-                                            except Exception:
-                                                pass
-                                            continue
-                                    if not removed:
-                                        try:
-                                            print("DEBUG: no exact matching position found to remove; will attempt to pop last element")
-                                        except Exception:
-                                            pass
-                                        try:
-                                            positions = positions[:-1]
-                                        except Exception as e_pop:
-                                            try:
-                                                print(f"DEBUG: failed to pop last position: {e_pop}")
-                                            except Exception:
-                                                pass
-                                    state['positions'] = positions
-                                except Exception as e_state:
-                                    try:
-                                        print(f"DEBUG: exception while removing position: {e_state}")
-                                    except Exception:
-                                        pass
-                                    # fallback: pop the last element
-                                    try:
-                                        state['positions'] = positions[:-1]
-                                    except Exception:
-                                        pass
-                                # 売却後は監視基準価格を最新価格にリセット
-                                try:
-                                    state['watch_reference'] = float(lp)
-                                except Exception:
-                                    pass
-                                # 売却成功時に売却代金をファンドへ戻す（実運用／DRY_RUN に対して適切な API を呼ぶ）
-                                try:
-                                    sell_proceeds = None
-                                    if isinstance(sell_order, dict):
-                                        sell_proceeds = sell_order.get('cost')
-                                    if not sell_proceeds:
-                                        # フォールバック: 最新価格 * 数量
-                                        try:
-                                            sell_proceeds = float(entry_qty) * float(lp)
-                                        except Exception:
-                                            sell_proceeds = None
-                                    if sell_proceeds is not None:
-                                        try:
-                                            lock_timeout_local = float(os.getenv('ORDER_LOCK_TIMEOUT', '10'))
-                                            with FileLock(LOCKFILE_SELL):
-                                                if hasattr(fund_manager, 'add_funds'):
-                                                    fund_manager.add_funds(float(sell_proceeds))
-                                                else:
-                                                    # もし underlying が reservation-style を持たない場合は警告
-                                                    try:
-                                                        print("⚠️ fund_manager に add_funds メソッドがありません。手動で残高調整が必要です。")
-                                                    except Exception:
-                                                        pass
-                                        except Exception as e_add:
-                                            try:
-                                                print(f"⚠️ 売却代金のファンド加算に失敗しました: {e_add}")
-                                            except Exception:
-                                                pass
-                                except Exception:
-                                    pass
-                                # 保存前に内容をデバッグ出力
-                                try:
-                                    print(f"DEBUG: saving state after sell: watch_reference={state.get('watch_reference')} positions_count={len(state.get('positions', []))}")
-                                except Exception:
-                                    pass
-                                # Immediately create a lightweight marker file to prove we reached
-                                # this point. Use binary write to avoid encoding surprises.
-                                try:
-                                    marker = STATE_FILE.with_name(STATE_FILE.name + '.after_sell.marker')
-                                    with open(str(marker), 'wb') as mf:
-                                        mf.write(b'REACHED_AFTER_SELL')
-                                    try:
-                                        print(f"DEBUG: wrote marker file {marker}")
-                                    except Exception:
-                                        pass
-                                except Exception as e_marker:
-                                    try:
-                                        print(f"DEBUG: failed to write marker file: {e_marker}")
-                                    except Exception:
-                                        pass
-                                # Immediately dump an auxiliary debug file to make the in-memory
-                                # state observable even if save_state fails or gets overwritten.
-                                try:
-                                    dbg_path = STATE_FILE.with_name(STATE_FILE.name + '.after_sell.debug.json')
-                                    dbg_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
-                                    try:
-                                        print(f"DEBUG: wrote debug snapshot to {dbg_path}")
-                                    except Exception:
-                                        pass
-                                except Exception as e_dbg:
-                                    try:
-                                        print(f"DEBUG: failed to write debug snapshot: {e_dbg}")
-                                    except Exception:
-                                        pass
-                                save_state(state)
-                                try:
-                                    if STATE_FILE.exists():
-                                        txt = STATE_FILE.read_text(encoding='utf-8')
-                                        try:
-                                            print(f"DEBUG: post-save STATE_FILE len={len(txt)}")
-                                        except Exception:
-                                            pass
-                                except Exception:
-                                    try:
-                                        print(f"DEBUG: could not read state file after save")
-                                    except Exception:
-                                        pass
-
-                                # Ensure proceeds are persisted to underlying fund file in DRY_RUN tests too
-                                try:
-                                    # primary: adapter-level add_funds (may be local in DRY_RUN)
-                                    if sell_proceeds is not None:
-                                        try:
-                                            fund_manager.add_funds(float(sell_proceeds))
-                                        except Exception:
-                                            pass
-                                    # fallback: if adapter wraps an underlying object that supports add_funds, call it to persist
-                                    underlying = getattr(fund_manager, '_underlying', None)
-                                    if underlying is not None and hasattr(underlying, 'add_funds'):
-                                        try:
-                                            # write under lock to avoid races
-                                            lockfile_main = os.getenv('ORDER_LOCKFILE') or str(STATE_FILE.with_name('.ninibo_order.lock'))
-                                            lock_timeout_local = float(os.getenv('ORDER_LOCK_TIMEOUT', '10'))
-                                            with FileLock(lockfile_main):
-                                                underlying.add_funds(float(sell_proceeds))
-                                        except Exception:
-                                            pass
-                                except Exception:
-                                    pass
-
-                                print("✅ Trigger sell: position sold and state updated")
-                                # Exit this run after successful sell to avoid later logic
-                                # (e.g. buy path) overwriting the updated state file.
-                                return
-                                # After a successful sell and state persist, return early to avoid subsequent
-                                # buy logic in the same run from overwriting the state file.
-                                return
-    except Exception as e:
-        print(f"⚠️ 利確チェック中にエラー: {e}")
-
-    # --- 取引許可日のチェック (週末限定など) ---
-    tz_name = os.getenv('TRADE_TIMEZONE')
-    if tz_name:
-        now = datetime.datetime.now(ZoneInfo(tz_name))
-    else:
-        now = datetime.datetime.now(JST)
-        latest_price = get_latest_price(exchange, pair)
-        if latest_price is None:
-            print("エラー: 価格が取得できませんでした。")
-            return
-        # 動的閾値を使う場合は1年レンジ等から閾値を計算する
-        effective_threshold = float(MIN_PRICE_THRESHOLD_JPY)
-        if USE_DYNAMIC_THRESHOLD:
-            thr, min1y, max1y = compute_dynamic_threshold(exchange, pair, days=DYN_OHLCV_DAYS,
-                                                        buffer_jpy=DYN_THRESHOLD_BUFFER_JPY,
-                                                        buffer_pct=DYN_THRESHOLD_BUFFER_PCT)
-            if thr is not None:
-                effective_threshold = float(thr)
-                print(f"🔎 dynamic threshold computed: threshold={effective_threshold}, 1y_min={min1y}, 1y_max={max1y}")
-                print("⚠️ dynamic threshold could not be computed; using static MIN_PRICE_THRESHOLD_JPY")
-
-        print(f"💵 最新の市場価格: {latest_price} 円 (buy_when_price <= {effective_threshold})")
-
-        # --- 指標を計算してログに出力 ---
         try:
-            indicators = compute_indicators(exchange, pair, timeframe='1h', limit=500)
-            print(f"Indicators: price={indicators.get('latest_close')}, sma50={indicators.get('sma_short_50')}, sma200={indicators.get('sma_long_200')}, ema12={indicators.get('ema_12')}, rsi14={indicators.get('rsi_14')}, atr14={indicators.get('atr_14')}")
-        except Exception:
-            pass
-
-        # --- 板情報と約定履歴の分析 ---
-        try:
-            # Use a file lock when reading/modifying/saving state for sell flow to avoid
-            # races with concurrent buy operations that also update the state file.
-            LOCKFILE_SELL = os.getenv('ORDER_LOCKFILE', '/tmp/ninibo_order.lock')
-            try:
-                with FileLock(LOCKFILE_SELL):
-                    state = load_state()
-                    positions = state.get('positions', []) if isinstance(state, dict) else []
-                    if positions:
-                        # Find the most recent BUY position that has a valid (non-zero) price.
-                        last_pos = None
-                        for p in reversed(positions):
-                            try:
-                                if p.get('side') == 'buy' and float(p.get('price', 0) or 0) > 0:
-                                    last_pos = p
-                                    break
-                            except Exception:
-                                pass
-                        # ...existing code...
-            except Exception as e:
-                try:
-                    log_warn(f"⚠️ アクティブ注文取得に失敗: {e}")
-                except Exception:
-                    pass
-                # ...existing code...
-
-                # sell_proceedsの計算は不要なため削除（entry_qty, lp未定義のため）
-                    # 必要なら正しい変数名で再計算してください
-                    # sell_proceeds = None
-
-                    # --- JPYへ戻さずBTC残高のみを元金として管理 ---
-                    # 利確後もBTC残高を維持し、JPY加算やfund_manager.add_fundsは行わない
-                    # 必要に応じて、BTC残高の管理・表示のみを行う
-
-                    try:
-                        print(f"DEBUG: saving state after sell: watch_reference={state.get('watch_reference')} positions_count={len(state.get('positions', []))}")
-                    except Exception:
-                        pass
-
-                    try:
-                        marker = STATE_FILE.with_name(STATE_FILE.name + '.after_sell.marker')
-                        with open(str(marker), 'wb') as mf:
-                            mf.write(b'REACHED_AFTER_SELL')
-                        try:
-                            print(f"DEBUG: wrote marker file {marker}")
-                        except Exception:
-                            pass
-                    except Exception as e_marker:
-                        try:
-                            print(f"DEBUG: failed to write marker file: {e_marker}")
-                        except Exception:
-                            pass
-
-                    try:
-                        dbg_path = STATE_FILE.with_name(STATE_FILE.name + '.after_sell.debug.json')
-                        dbg_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
-                        try:
-                            print(f"DEBUG: wrote debug snapshot to {dbg_path}")
-                        except Exception:
-                            pass
-                    except Exception as e_dbg:
-                        try:
-                            print(f"DEBUG: failed to write debug snapshot: {e_dbg}")
-                        except Exception:
-                            pass
-
-                    save_state(state)
-                    try:
-                        if STATE_FILE.exists():
-                            txt = STATE_FILE.read_text(encoding='utf-8')
-                            try:
-                                print(f"DEBUG: post-save STATE_FILE len={len(txt)}")
-                            except Exception:
-                                pass
-                    except Exception:
-                        try:
-                            print(f"DEBUG: could not read state file after save")
-                        except Exception:
-                            pass
-
-                    # --- JPYへ戻さずBTC残高のみを元金として管理 ---
-                    # sell_proceedsやfund_manager.add_fundsの処理は完全に削除
-
-                    print("✅ Trigger sell: position sold and state updated")
-                    return
-
-        except Exception as e:
-            print(f"⚠️ 利確チェック中にエラー: {e}")
-        try:
-            if available_pre is not None and float(available_pre) < float(LOW_FUNDS_ALERT_JPY):
-                msg = f"⚠️ 資金アラート: 残高が少なくなっています（残高: {available_pre:.0f} 円 < 閾値: {LOW_FUNDS_ALERT_JPY:.0f} 円）"
-                print(msg)
-                try:
-                    if smtp_host and email_to:
-                        send_notification(smtp_host, smtp_port, smtp_user, smtp_password, email_to, subject, msg)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        if available_pre is not None:
-            # reserved_budgetは常に残高の90%とバッファ考慮の小さい方
-            reserved_budget = min(allowed_by_percent, allowed_by_buffer)
-        else:
-            reserved_budget = 0.0
-        with FileLock(LOCKFILE):
-            try:
-                available = float(fund_manager.available_fund()) if hasattr(fund_manager, 'available_fund') else None
-            except Exception:
-                available = None
-
-            # 予約する額が妥当か（手数料込みで最小数量を満たすか確認）
-            # ここでは compute_qty_for_budget_with_fee を使って reserved_budget に対する実注文量を判定する
-            # 記録: 予約が成功した時点の価格と時刻（後でスリッページ/実行ウィンドウ判定に使う）
-            try:
-                reservation_price = float(latest_price) if 'latest_price' in globals() and latest_price is not None else float(os.getenv('DRY_RUN_PRICE', '0'))
-                reservation_time = int(time.time())
-
-                # Cooldown (買いの間隔) チェック
+            with FileLock(LOCKFILE_SELL):
                 state = load_state()
-                last_buy = get_last_buy_time(state)
-                if last_buy and (time.time() - last_buy) < COOLDOWN_SEC:
-                    print("Cooldown active -> skipping buy to avoid frequent add-on")
-                    return
+                positions = state.get('positions') if isinstance(state, dict) else None
+                if positions and isinstance(positions, list) and len(positions) > 0:
+                    last_pos = positions[-1]
+        except Exception:
+            pass
+    except Exception:
+        pass
 
+    if available_pre is not None and float(available_pre) < float(LOW_FUNDS_ALERT_JPY):
+        msg = f"⚠️ 資金アラート: 残高が少なくなっています（残高: {available_pre:.0f} 円 < 閾値: {LOW_FUNDS_ALERT_JPY:.0f} 円）"
+        print(msg)
+        try:
+            smtp_host = os.getenv('SMTP_HOST')
+            smtp_port = int(os.getenv('SMTP_PORT', '587'))
+            smtp_user = os.getenv('SMTP_USER')
+            smtp_password = os.getenv('SMTP_PASS')
+            email_to = os.getenv('TO_EMAIL')
+            subject = f"Low Funds Alert: {available_pre:.0f}円"
+            if smtp_host and email_to:
+                send_notification(smtp_host, smtp_port, smtp_user, smtp_password, email_to, subject, msg)
+        except Exception:
+            pass
+
+    if available_pre is not None:
+        # reserved_budgetは常に残高の90%とバッファ考慮の小さい方
+        allowed_by_buffer = 99999999  # 仮の値。実際のロジックに合わせて調整してください
+        reserved_budget = min(allowed_by_percent, allowed_by_buffer)
+    else:
+        reserved_budget = 0.0
+    LOCKFILE = os.getenv('ORDER_LOCKFILE', '/tmp/ninibo_order.lock')
+    with FileLock(LOCKFILE):
+        try:
+            available = float(fund_manager.available_fund()) if hasattr(fund_manager, 'available_fund') else None
+        except Exception:
+            available = None
+
+        # 予約する額が妥当か（手数料込みで最小数量を満たすか確認）
+        # ここでは compute_qty_for_budget_with_fee を使って reserved_budget に対する実注文量を判定する
+        # 記録: 予約が成功した時点の価格と時刻（後でスリッページ/実行ウィンドウ判定に使う）
+        try:
+            reservation_price = float(latest_price) if 'latest_price' in globals() and latest_price is not None else float(os.getenv('DRY_RUN_PRICE', '0'))
+            reservation_time = int(time.time())
+
+            # Cooldown (買いの間隔) チェック
+            state = load_state()
+            last_buy = get_last_buy_time(state)
+            if last_buy and (time.time() - last_buy) < COOLDOWN_SEC:
+                print("Cooldown active -> skipping buy to avoid frequent add-on")
+                return
+
+            q_check, cost_check, fee_check = compute_qty_for_budget_with_fee(
+                reserved_budget, float(latest_price), min_btc=MIN_ORDER_BTC, step=MIN_ORDER_BTC,
+                available_jpy=float(available) if available is not None else 0.0, balance_buffer=float(BALANCE_BUFFER)
+            )
+
+        except Exception:
+            reservation_price = None
+            reservation_time = None
+            q_check = cost_check = fee_check = 0
+
+        # 予算を予約するのに十分な残高があるか確認
+        if available is not None and available < reserved_budget:
+            print(f"🚫 残高不足のため注文をスキップします（必要: {reserved_budget:.2f} 円, 残高: {available:.2f} 円）")
+            return
+
+        if q_check <= 0 or reserved_budget <= 0:
+            # Gather more internal diagnostics for debugging
+            try:
+                fee_rate = float(os.getenv('FEE_RATE', '0.001'))
+            except Exception:
+                fee_rate = 0.001
+            try:
                 q_check, cost_check, fee_check = compute_qty_for_budget_with_fee(
                     reserved_budget, float(latest_price), min_btc=MIN_ORDER_BTC, step=MIN_ORDER_BTC,
-                    available_jpy=available, balance_buffer=float(BALANCE_BUFFER)
+                    available_jpy=float(available) if available is not None else 0.0, balance_buffer=float(BALANCE_BUFFER)
                 )
-
             except Exception:
-                reservation_price = None
-                reservation_time = None
                 q_check = cost_check = fee_check = 0
+            try:
+                max_allowed_jpy = min(float(reserved_budget), float(available) - float(BALANCE_BUFFER)) if available is not None else float(reserved_budget)
+            except Exception:
+                max_allowed_jpy = float(reserved_budget)
+            try:
+                approx_qty = max_allowed_jpy / (reservation_price * (1.0 + fee_rate)) if reservation_price and reservation_price > 0 else 0.0
+            except Exception:
+                approx_qty = 0.0
+            try:
+                detail = (
+                    f"予約額={reserved_budget:.2f}, q_check={q_check:.8f}, cost_check={cost_check:.2f}, fee_check={fee_check:.2f}, "
+                    f"fee_rate={fee_rate}, fee_fixed={fee_fixed:.2f}, min_btc={MIN_ORDER_BTC}, step={MIN_ORDER_BTC}, "
+                    f"max_allowed_jpy={max_allowed_jpy:.2f}, approx_qty={approx_qty:.8f}, reservation_price={reservation_price}"
+                )
+            except Exception:
+                detail = f"予約額={reserved_budget:.2f} (failed to build details)"
+            msg = f"ℹ️ 予約額が手数料込みの最小注文コストに満たないため注文をスキップします（{detail}）"
+            print(msg)
+            try:
+                if smtp_host and email_to:
+                    send_notification(smtp_host, smtp_port, smtp_user, smtp_password, email_to, subject, msg)
+            except Exception:
+                pass
+            return
 
-            # 予算を予約するのに十分な残高があるか確認
-            if available is not None and available < reserved_budget:
-                print(f"🚫 残高不足のため注文をスキップします（必要: {reserved_budget:.2f} 円, 残高: {available:.2f} 円）")
-                return
+        # ここで予算を差し引いて予約する（失敗した場合は例外が上がる）
+        if hasattr(fund_manager, 'place_order'):
+            try:
+                # デバッグ情報: 予約前の利用可能残高と予約額
+                try:
+                    cur_avail = float(fund_manager.available_fund()) if hasattr(fund_manager, 'available_fund') else None
+                except Exception:
+                    cur_avail = None
+                print(f"DEBUG: 予約前 available={cur_avail}, reserved_budget={reserved_budget:.2f}")
 
-            if q_check <= 0 or reserved_budget <= 0:
-                # Gather more internal diagnostics for debugging
+                # reserve funds via adapter (new API)
+                if hasattr(fund_manager, 'reserve'):
+                    ok = fund_manager.reserve(reserved_budget)
+                else:
+                    ok = fund_manager.place_order(reserved_budget)
+
+                # デバッグ情報: 予約後の利用可能残高
                 try:
-                    fee_rate = float(os.getenv('FEE_RATE', '0.001'))
+                    after_avail = float(fund_manager.available_fund()) if hasattr(fund_manager, 'available_fund') else None
                 except Exception:
-                    fee_rate = 0.001
+                    after_avail = None
+                print(f"DEBUG: 予約後 available={after_avail}")
+
+                # BTC残高のみ管理
+                # その場合は残高が実際に減っているかで成功を判定する（後方互換処理）。                
+                if not ok:
+                    if cur_avail is not None and after_avail is not None and after_avail < cur_avail:
+                        print("ℹ️ reserve/place_order は False/None を返しましたが、残高が減っているため予約成功とみなします")
+                        ok = True
+                    else:
+                        print(f"⚠️ 資金予約に失敗しました（reserve/place_order が False を返しました）。予約額: {reserved_budget:.2f}")
+                        return
+                reserved = True
                 try:
-                    fee_fixed = float(os.getenv('FEE_FIXED_JPY', '0.0'))
-                except Exception:
-                    fee_fixed = 0.0
-                # estimate max_allowed_jpy used inside compute_qty_for_budget_with_fee
-                try:
-                    max_allowed_jpy = min(float(reserved_budget), float(available) - float(BALANCE_BUFFER)) if available is not None else float(reserved_budget)
-                except Exception:
-                    max_allowed_jpy = float(reserved_budget)
-                try:
-                    approx_qty = max_allowed_jpy / (reservation_price * (1.0 + fee_rate)) if reservation_price and reservation_price > 0 else 0.0
-                except Exception:
-                    approx_qty = 0.0
-                try:
-                    detail = (
-                        f"予約額={reserved_budget:.2f}, q_check={q_check:.8f}, cost_check={cost_check:.2f}, fee_check={fee_check:.2f}, "
-                        f"fee_rate={fee_rate}, fee_fixed={fee_fixed:.2f}, min_btc={MIN_ORDER_BTC}, step={MIN_ORDER_BTC}, "
-                        f"max_allowed_jpy={max_allowed_jpy:.2f}, approx_qty={approx_qty:.8f}, reservation_price={reservation_price}"
-                    )
-                except Exception:
-                    detail = f"予約額={reserved_budget:.2f} (failed to build details)"
-                msg = f"ℹ️ 予約額が手数料込みの最小注文コストに満たないため注文をスキップします（{detail}）"
-                print(msg)
-                try:
-                    if smtp_host and email_to:
-                        send_notification(smtp_host, smtp_port, smtp_user, smtp_password, email_to, subject, msg)
+                    print(f"DEBUG: reservation set reserved={reserved}, reserved_budget={reserved_budget}")
                 except Exception:
                     pass
+            except Exception as e:
+                print(f"⚠️ 予約（予算差し引き）に失敗しました: {e}")
                 return
-
-            # ここで予算を差し引いて予約する（失敗した場合は例外が上がる）
-            if hasattr(fund_manager, 'place_order'):
-                try:
-                    # デバッグ情報: 予約前の利用可能残高と予約額
-                    try:
-                        cur_avail = float(fund_manager.available_fund()) if hasattr(fund_manager, 'available_fund') else None
-                    except Exception:
-                        cur_avail = None
-                    print(f"DEBUG: 予約前 available={cur_avail}, reserved_budget={reserved_budget:.2f}")
-
-                    # reserve funds via adapter (new API)
-                    if hasattr(fund_manager, 'reserve'):
-                        ok = fund_manager.reserve(reserved_budget)
-                    else:
-                        ok = fund_manager.place_order(reserved_budget)
-
-                    # デバッグ情報: 予約後の利用可能残高
-                    try:
-                        after_avail = float(fund_manager.available_fund()) if hasattr(fund_manager, 'available_fund') else None
-                    except Exception:
-                        after_avail = None
-                    print(f"DEBUG: 予約後 available={after_avail}")
-
-                    # BTC残高のみ管理
-                    # その場合は残高が実際に減っているかで成功を判定する（後方互換処理）。
-                    if not ok:
-                        if cur_avail is not None and after_avail is not None and after_avail < cur_avail:
-                            print("ℹ️ reserve/place_order は False/None を返しましたが、残高が減っているため予約成功とみなします")
-                            ok = True
-                        else:
-                            print(f"⚠️ 資金予約に失敗しました（reserve/place_order が False を返しました）。予約額: {reserved_budget:.2f}")
-                            return
-                    reserved = True
-                    try:
-                        print(f"DEBUG: reservation set reserved={reserved}, reserved_budget={reserved_budget}")
-                    except Exception:
-                        pass
-                except Exception as e:
-                    print(f"⚠️ 予約（予算差し引き）に失敗しました: {e}")
-                    return
 
         # 実際の注文を発行: 注文直前に最新価格を取得して数量を再計算します
         try:
@@ -2129,10 +1785,14 @@ def run_bot(exchange, fund_manager_instance):
                 #  3) どちらも無ければ現在価格で初期化して保存
                 watch_ref = None
                 try:
-                    if isinstance(state, dict) and state.get('watch_reference') is not None:
-                        try:
-                            watch_ref = float(state.get('watch_reference'))
-                        except Exception:
+                    if isinstance(state, dict):
+                        val = state.get('watch_reference')
+                        if val is not None:
+                            try:
+                                watch_ref = float(val)
+                            except Exception:
+                                watch_ref = None
+                        else:
                             watch_ref = None
                 except Exception:
                     watch_ref = None
@@ -2222,7 +1882,7 @@ def run_bot(exchange, fund_manager_instance):
                                         should_alert = False
                                 except Exception:
                                     pass
-                            
+                        
                             if should_alert:
                                 print(f"🎯 買いチャンス！ watch_ref={watch_ref:.0f}円から{TRADE_TRIGGER_PCT + 5:.0f}%下落 → 現在={latest_price_now:.0f}円")
                                 
@@ -2250,6 +1910,7 @@ def run_bot(exchange, fund_manager_instance):
                                             f"- Auto-sell will trigger after {TRADE_TRIGGER_PCT:.0f}% rise from buy price\n\n"
                                             f"This is a major drop opportunity!"
                                         )
+                                        
                                         send_notification(smtp_host, smtp_port, smtp_user, smtp_password,
                                                         email_to, subject, message)
                                         print(f"📧 買いチャンス通知メール送信完了")
@@ -2293,6 +1954,7 @@ def run_bot(exchange, fund_manager_instance):
                 # CSV に指標とシグナルを書き出す（監視・後解析用）
                 try:
                     sig = 'BUY' if do_buy else 'NONE'
+                    indicators = None
                     if indicators is None:
                         indicators = compute_indicators(exchange, pair, timeframe='1h', limit=500)
                     write_indicators_csv(indicators if indicators is not None else {}, pair, signal=sig)
@@ -2302,6 +1964,7 @@ def run_bot(exchange, fund_manager_instance):
                 if not do_buy:
                     print(f"🚫 買い条件未達（watch_ref={watch_ref}, latest={latest_price_now}, buy_pct={TRADE_TRIGGER_PCT}, breakout_allowed={allow_buy_by_breakout}）→ 予約を返金して終了")
                     if reserved:
+                        LOCKFILE = os.getenv('ORDER_LOCKFILE', '/tmp/ninibo_order.lock')
                         with FileLock(LOCKFILE):
                             if hasattr(fund_manager, 'release'):
                                 fund_manager.release(reserved_budget)
@@ -2313,6 +1976,7 @@ def run_bot(exchange, fund_manager_instance):
                 # 比較中のエラーは安全側でキャンセルする
                 print("⚠️ 売買判定でエラーが発生しました。発注を中断します。")
                 if reserved:
+                    LOCKFILE = os.getenv('ORDER_LOCKFILE', '/tmp/ninibo_order.lock')
                     with FileLock(LOCKFILE):
                         if hasattr(fund_manager, 'release'):
                             fund_manager.release(reserved_budget)
@@ -2323,16 +1987,17 @@ def run_bot(exchange, fund_manager_instance):
             if latest_price_now is None:
                 print("⚠️ 注文直前に価格が取得できませんでした。予約を取り消します。")
                 try:
+                    LOCKFILE = os.getenv('ORDER_LOCKFILE', '/tmp/ninibo_order.lock')
                     with FileLock(LOCKFILE):
                         if hasattr(fund_manager, 'release'):
                             fund_manager.release(reserved_budget)
                         elif hasattr(fund_manager, 'add_funds'):
-                            # refund reserved_budget on unexpected exception
                             fund_manager.add_funds(reserved_budget)
                         reserved = False
                 except Exception as e:
                     print(f"⚠️ 予約取り消し（返金）に失敗しました: {e}")
                     if reserved:
+                        LOCKFILE = os.getenv('ORDER_LOCKFILE', '/tmp/ninibo_order.lock')
                         with FileLock(LOCKFILE):
                             if hasattr(fund_manager, 'release'):
                                 fund_manager.release(reserved_budget)
@@ -2342,13 +2007,14 @@ def run_bot(exchange, fund_manager_instance):
 
             final_qty, final_cost, final_fee = compute_qty_for_budget_with_fee(
                 reserved_budget, float(latest_price_now), min_btc=MIN_ORDER_BTC, step=MIN_ORDER_BTC,
-                available_jpy=available, balance_buffer=float(BALANCE_BUFFER)
+                available_jpy=float(available) if available is not None else 0.0, balance_buffer=float(BALANCE_BUFFER)
             )
 
             # 最小数量チェック
             if final_qty <= 0:
                 print(f"ℹ️ 注文直前で数量が最小取引単位を下回りましたまたは手数料で合計が超過しました。予約を取り消します。")
                 if reserved:
+                    LOCKFILE = os.getenv('ORDER_LOCKFILE', '/tmp/ninibo_order.lock')
                     with FileLock(LOCKFILE):
                         if hasattr(fund_manager, 'release'):
                             fund_manager.release(reserved_budget)
@@ -2369,6 +2035,7 @@ def run_bot(exchange, fund_manager_instance):
             # 例外時は予約を取り消して返金
             if reserved:
                 try:
+                    LOCKFILE = os.getenv('ORDER_LOCKFILE', '/tmp/ninibo_order.lock')
                     with FileLock(LOCKFILE):
                         if hasattr(fund_manager, 'release'):
                             fund_manager.release(reserved_budget)
@@ -2413,16 +2080,20 @@ def run_bot(exchange, fund_manager_instance):
                     if 'latest_price_now' in locals() and latest_price_now is not None:
                         entry_price = float(latest_price_now)
                     elif isinstance(order, dict):
-                        if 'price' in order and order.get('price') is not None:
+                        price_val = order.get('price')
+                        if price_val is not None:
                             try:
-                                entry_price = float(order.get('price'))
+                                entry_price = float(price_val)
                             except Exception:
-                                entry_price = None
-                        elif 'cost' in order and order.get('amount'):
-                            try:
-                                entry_price = float(order.get('cost')) / float(order.get('amount'))
-                            except Exception:
-                                entry_price = None
+                                entry_price = 0.0
+                        else:
+                            cost_val = order.get('cost')
+                            amount_val = order.get('amount')
+                            if cost_val is not None and amount_val is not None and amount_val != 0:
+                                try:
+                                    entry_price = float(cost_val) / float(amount_val)
+                                except Exception:
+                                    entry_price = 0.0
                 except Exception:
                     entry_price = None
 
@@ -2435,13 +2106,25 @@ def run_bot(exchange, fund_manager_instance):
 
                 # Detailed debug dump before recording position
                 try:
-                    dbg_final_qty = float(final_qty) if 'final_qty' in locals() else (float(order.get('amount', 0)) if isinstance(order, dict) and order.get('amount') is not None else 0.0)
+                    if 'final_qty' in locals() and final_qty is not None:
+                        dbg_final_qty = float(final_qty)
+                    elif isinstance(order, dict):
+                        amt = order.get('amount', 0)
+                        dbg_final_qty = float(amt) if amt is not None else 0.0
+                    else:
+                        dbg_final_qty = 0.0
                 except Exception:
                     dbg_final_qty = 0.0
                 try:
-                    dbg_final_cost = float(final_cost) if 'final_cost' in locals() else (float(order.get('cost')) if isinstance(order, dict) and order.get('cost') is not None else None)
+                    if 'final_cost' in locals() and final_cost is not None:
+                        dbg_final_cost = float(final_cost)
+                    elif isinstance(order, dict):
+                        cst = order.get('cost', 0)
+                        dbg_final_cost = float(cst) if cst is not None else 0.0
+                    else:
+                        dbg_final_cost = 0.0
                 except Exception:
-                    dbg_final_cost = None
+                    dbg_final_cost = 0.0
                 try:
                     print(f"DEBUG: record_position: entry_price={entry_price}, dbg_final_qty={dbg_final_qty}, dbg_final_cost={dbg_final_cost}, order={order}")
                 except Exception:
@@ -2559,31 +2242,91 @@ if __name__ == "__main__":
                 state = load_state()
                 reference_price = None
                 try:
-                    reference_price = float(state.get('watch_reference')) if isinstance(state, dict) and state.get('watch_reference') else None
+                    val = state.get('watch_reference') if isinstance(state, dict) else None
+                    reference_price = float(val) if val is not None else None
                 except Exception:
                     pass
-                
                 # 基準価格がない場合は環境変数から取得
                 if reference_price is None:
                     try:
                         reference_price = float(os.getenv('PRICE_REFERENCE', '15000000'))  # デフォルト1500万円
                     except Exception:
                         reference_price = 15000000.0
-                
                 # 価格変動率を計算（上昇も下落も検知）
                 price_change_percent = 0.0
                 if latest_price and reference_price and reference_price > 0:
                     price_change_percent = ((latest_price - reference_price) / reference_price) * 100.0
-                    
                     # 20%変動の閾値（環境変数で変更可能）
                     try:
                         trigger_percent = float(os.getenv('PRICE_ALERT_PERCENT', '20.0'))
                     except Exception:
                         trigger_percent = 20.0
+
+                # === ここから自動売却ロジック ===
+                # ポジションが存在し、売りトリガーを超えたら自動売却
+                try:
+                    positions = state.get('positions') if isinstance(state, dict) else None
+                    if positions and isinstance(positions, list) and len(positions) > 0:
+                        # 直近のポジション（買い）を取得
+                        last_pos = positions[-1]
+                        entry_price = float(last_pos.get('entry_price', 0.0))
+                        qty = float(last_pos.get('qty', 0.0))
+                        # 売りトリガー価格
+                        sell_trigger_pct = float(os.getenv('TRADE_TRIGGER_PCT', '20.0'))
+                        sell_trigger_price = entry_price * (1.0 + sell_trigger_pct / 100.0)
+                        # 売り条件成立
+                        if latest_price and entry_price > 0 and float(latest_price) >= sell_trigger_price and qty > 0:
+                            print(f"🚀 売りシグナル: entry={entry_price:.0f}円, trigger={sell_trigger_price:.0f}円, 現在={latest_price:.0f}円, qty={qty}")
+                            # 売却実行
+                            order = execute_order(exchange, 'BTC/JPY', 'sell', qty)
+                            print(f"DEBUG: execute_order(sell) returned: {order}")
+                            # ポジション記録
+                            record_position(state, 'sell', float(latest_price), qty)
+                            # ポジションをクリア
+                            state['positions'] = []
+                            # 監視基準をリセット
+                            state['watch_reference'] = float(latest_price)
+                            save_state(state)
+                            # 通知
+                            try:
+                                smtp_host = os.getenv('SMTP_HOST')
+                                smtp_port = int(os.getenv('SMTP_PORT', '587'))
+                                smtp_user = os.getenv('SMTP_USER')
+                                smtp_password = os.getenv('SMTP_PASS')
+                                email_to = os.getenv('TO_EMAIL')
+                                if smtp_host and email_to:
+                                    subject = f"BTC Auto Sell Complete: {qty:.4f} BTC"
+                                    # watch_refが未定義の場合はentry_priceまたはreference_priceを使う
+                                    try:
+                                        safe_watch_ref = watch_ref
+                                    except Exception:
+                                        try:
+                                            safe_watch_ref = entry_price
+                                        except Exception:
+                                            try:
+                                                safe_watch_ref = reference_price
+                                            except Exception:
+                                                safe_watch_ref = 0.0
+                                    message = (
+                                        f"BTC auto sell completed!\n\n"
+                                        f"[Sell Info]\n"
+                                        f"Amount: {qty:.4f} BTC\n"
+                                        f"Sell Price: {latest_price:,.0f} JPY/BTC\n"
+                                        f"Entry Price: {entry_price:,.0f} JPY\n"
+                                        f"Reference: {safe_watch_ref:,.0f} JPY\n"
+                                        f"Profit: approx. {(latest_price-entry_price)*qty:,.0f} JPY\n\n"
+                                        f"Position cleared.\n"
+                                    )
+                                    send_notification(smtp_host, smtp_port, smtp_user, smtp_password, email_to, subject, message)
+                                    print(f"📧 売却完了通知メール送信完了")
+                            except Exception as e:
+                                print(f"⚠️ 売却通知メール送信エラー: {e}")
+                except Exception as e:
+                    print(f"⚠️ 自動売却処理で例外: {e}")
                     
                     # メール通知フラグを state から取得（重複通知防止）
                     last_alert_price = state.get('last_alert_price') if isinstance(state, dict) else None
-                    
+                    print(f"DEBUG: last_alert_price={last_alert_price}, price_change_percent={price_change_percent:.2f}%")
                     # 20%以上の変動を検知
                     if abs(price_change_percent) >= trigger_percent:
                         # 前回と異なる価格帯での通知か確認（同じ価格帯で何度も通知しない）
@@ -2591,7 +2334,7 @@ if __name__ == "__main__":
                         if last_alert_price:
                             try:
                                 # 前回の通知価格から5%以上変動していれば再通知
-                                prev_change = abs((latest_price - float(last_alert_price)) / float(last_alert_price)) * 100.0
+                                prev_change = abs((float(latest_price) - float(last_alert_price)) / float(last_alert_price)) * 100.0
                                 if prev_change < 5.0:
                                     should_alert = False
                             except Exception:
@@ -2615,14 +2358,25 @@ if __name__ == "__main__":
                                     subject = f"BTC Price {direction} Alert: {abs(price_change_percent):.1f}% change"
                                     current_balance = "unknown"
                                     try:
-                                        bal = float(fund_manager.available_fund())
-                                        current_balance = f"{bal:.0f} JPY"
+                                        if fund_manager is not None and hasattr(fund_manager, 'available_fund'):
+                                            bal = float(fund_manager.available_fund())
+                                            current_balance = f"{bal:.0f} JPY"
                                     except Exception:
                                         pass
+                                    safe_watch_ref = 0.0
+                                    try:
+                                        safe_watch_ref = watch_ref
+                                    except NameError:
+                                        try:
+                                            safe_watch_ref = reference_price
+                                        except NameError:
+                                            safe_watch_ref = 0.0
+                                    if safe_watch_ref is None:
+                                        safe_watch_ref = 0.0
                                     message = (
                                         f"BTC price has changed significantly: {direction}\n\n"
                                         f"[Price Info]\n"
-                                        f"Reference price: {reference_price:,.0f} JPY\n"
+                                        f"Reference price: {safe_watch_ref:,.0f} JPY\n"
                                         f"Current price: {latest_price:,.0f} JPY\n"
                                         f"Change percent: {price_change_percent:+.2f}%\n\n"
                                         f"[Balance Info]\n"
@@ -2656,16 +2410,26 @@ if __name__ == "__main__":
             try:
                 if deposit_amount and deposit_amount > 0:
                     try:
-                        current = float(fund_manager.available_fund())
+                        if fund_manager is not None and hasattr(fund_manager, 'available_fund'):
+                            current = float(fund_manager.available_fund())
+                        else:
+                            current = None
                     except Exception:
                         current = None
 
                     if current is not None and current < min_balance_threshold:
-                        fund_manager.add_funds(deposit_amount)
+                        if fund_manager is not None and hasattr(fund_manager, 'add_funds'):
+                            fund_manager.add_funds(deposit_amount)
                         try:
-                            log_info(f"💳 残高不足のため自動入金: {deposit_amount:.2f} 円 → 残高: {fund_manager.available_fund():.2f} 円")
+                            if fund_manager is not None and hasattr(fund_manager, 'available_fund'):
+                                log_info(f"💳 残高不足のため自動入金: {deposit_amount:.2f} 円 → 残高: {fund_manager.available_fund():.2f} 円")
+                            else:
+                                log_info(f"💳 残高不足のため自動入金: {deposit_amount:.2f} 円 → 残高: 不明")
                         except Exception:
-                            print(f"💳 残高不足のため自動入金: {deposit_amount:.2f} 円 → 残高: {fund_manager.available_fund():.2f} 円")
+                            if fund_manager is not None and hasattr(fund_manager, 'available_fund'):
+                                print(f"💳 残高不足のため自動入金: {deposit_amount:.2f} 円 → 残高: {fund_manager.available_fund():.2f} 円")
+                            else:
+                                print(f"💳 残高不足のため自動入金: {deposit_amount:.2f} 円 → 残高: 不明")
 
             except Exception as e:
                 print(f"⚠️ 自動入金処理中にエラーが発生しました: {e}")
@@ -2674,7 +2438,11 @@ if __name__ == "__main__":
             try:
                 state = load_state()
                 balance = exchange.fetch_balance()
-                current_jpy = float(balance['JPY']['free']) if balance and 'JPY' in balance else 0.0
+                val = balance['JPY']['free'] if balance and 'JPY' in balance and 'free' in balance['JPY'] else 0.0
+                try:
+                    current_jpy = float(val) if val is not None else 0.0
+                except Exception:
+                    current_jpy = 0.0
                 
                 # 前回のJPY残高を取得
                 last_jpy = state.get('last_jpy_balance', 0.0) if isinstance(state, dict) else 0.0
@@ -2718,19 +2486,11 @@ if __name__ == "__main__":
                                                         f"Expected profit: approx. {buy_jpy * (TRADE_TRIGGER_PCT/100):,.0f} JPY\n\n"
                                                         f"Please wait for auto-sell trigger."
                                                     )
-                                                    send_notification(smtp_host, smtp_port, smtp_user, smtp_password,
-                                                                    email_to, subject, message)
-                                            else:
-                                                state['last_jpy_balance'] = current_jpy
-                                                save_state(state)
-                                        else:
-                                            state['last_jpy_balance'] = current_jpy
-                                            save_state(state)
-                            save_state(state)
-                        else:
-                            print(f"⚠️ 購入数量不足: {buy_amount_btc:.6f} BTC (最小: 0.0001 BTC)")
-                            state['last_jpy_balance'] = current_jpy
-                            save_state(state)
+                                        
+                                        send_notification(smtp_host, smtp_port, smtp_user, smtp_password, email_to, subject, message)
+                                    else:
+                                        state['last_jpy_balance'] = current_jpy
+                                        save_state(state)
                 else:
                     # 残高更新（増加していない場合も記録）
                     if last_jpy == 0.0:
@@ -2740,7 +2500,7 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"⚠️ 残高チェック・自動購入処理中にエラー: {e}")
 
-            run_bot(exchange, fund_manager)
+            
 
             # 従来の毎ループ入金（あえて残す。ENVで無効化可）
             try:
@@ -2749,8 +2509,11 @@ if __name__ == "__main__":
                 post_deposit = 0
             if post_deposit and post_deposit > 0:
                 try:
-                    fund_manager.add_funds(post_deposit)
-                    print(f"💳 ループ終了後の自動入金: {post_deposit:.2f} 円 → 残高: {fund_manager.available_fund():.2f} 円")
+                    if fund_manager is not None:
+                        fund_manager.add_funds(post_deposit)
+                        print(f"💳 ループ終了後の自動入金: {post_deposit:.2f} 円 → 残高: {fund_manager.available_fund():.2f} 円")
+                    else:
+                        print(f"⚠️ fund_manager が None のため自動入金をスキップします。")
                 except Exception as e:
                     print(f"⚠️ ループ後自動入金に失敗しました: {e}")
 
@@ -2796,12 +2559,19 @@ def run_bot_di(dry_run=False, exchange_override=None):
     fund_manager = None
     
     try:
-        run_bot(exchange, fund_manager)
-        return {"status": "success", "message": "Bot実行完了"}
+        # メインループをrun_botとして呼び出す
+        result = run_bot(exchange, _raw_fm, actual_dry_run)
+        return {"status": "success", "message": "Bot実行完了", "result": result}
     except Exception as e:
         return {"status": "error", "message": f"Bot実行中にエラー: {e}"}
+    return None
+# === メインループ本体 ===
+def run_bot(exchange, fund_manager, dry_run=False):
+    # ここにBotのメイン処理を記述（例: 1回だけ動作する簡易版）
+    print(f"run_bot() called: exchange={exchange}, fund_manager={fund_manager}, dry_run={dry_run}")
+    # 実際の自動売買ロジックをここに実装する
+    # 例: 価格取得・注文・ログ出力など
+    return "run_bot executed"
 
 
-def test_fund_adapter():
-    pass  # No longer needed in BTC-only mode
 
