@@ -1,3 +1,152 @@
+# --- run_bot関数の最低限定義（未定義エラー対策） ---
+def run_bot(exchange, fund_manager, dry_run=False):
+    import time
+    import pandas as pd
+    PAIR = 'BTC/JPY'
+    INTERVAL = '1h'
+    LOOP_INTERVAL = 3600  # 1時間ごと
+    MIN_ORDER_BTC = float(os.getenv('MIN_ORDER_BTC', '0.0001'))
+    MAX_RISK_PERCENT = float(os.getenv('MAX_RISK_PERCENT', '0.05'))
+    BALANCE_BUFFER = float(os.getenv('BALANCE_BUFFER', '1000'))
+    RSI_BUY = float(os.getenv('RSI_BUY', '30'))
+    RSI_SELL = float(os.getenv('RSI_SELL', '70'))
+    PROFIT_TAKE_PCT = float(os.getenv('PROFIT_TAKE_PCT', '10'))
+    STOP_LOSS_PCT = float(os.getenv('STOP_LOSS_PCT', '5'))
+
+    def fetch_ohlcv():
+        ohlcv = exchange.fetch_ohlcv(PAIR, INTERVAL, limit=200)
+        df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+        df['close'] = df['close'].astype(float)
+        return df
+
+    def calc_rsi(df, period=14):
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        avg_gain = gain.rolling(window=period).mean()
+        avg_loss = loss.rolling(window=period).mean()
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+
+    def calc_macd(df, fast=12, slow=26, signal=9):
+        ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
+        ema_slow = df['close'].ewm(span=slow, adjust=False).mean()
+        macd = ema_fast - ema_slow
+        macd_signal = macd.ewm(span=signal, adjust=False).mean()
+        return macd, macd_signal
+
+    def get_balance():
+        bal = exchange.fetch_balance()
+        jpy = bal['JPY']['free'] if 'JPY' in bal and 'free' in bal['JPY'] else 0.0
+        btc = bal['BTC']['free'] if 'BTC' in bal and 'free' in bal['BTC'] else 0.0
+        return float(jpy), float(btc)
+
+    def place_order(side, amount):
+        if dry_run:
+            print(f"DRY_RUN: {side} {amount:.4f} BTC")
+            return None
+        if side == 'buy':
+            order = exchange.create_order(PAIR, 'market', 'buy', amount)
+        else:
+            order = exchange.create_order(PAIR, 'market', 'sell', amount)
+        print(f"注文: {side} {amount:.4f} BTC")
+        return order
+
+
+    # ポジション管理リスト（複数購入・分割売却対応）
+
+    # --- 初期ポジション（手動設定例） ---
+    # ここを編集すれば、過去の購入分をBOT起動時に管理対象にできる
+    positions = [
+        {'price': 13090000, 'amount': 0.0008, 'timestamp': None},
+        {'price': 14410000, 'amount': 0.0001, 'timestamp': None},
+        {'price': 14229000, 'amount': 0.0004, 'timestamp': None},
+    ]  # [{'price':購入価格, 'amount':数量, 'timestamp':時刻}]
+
+    while True:
+        df = fetch_ohlcv()
+        df['rsi'] = calc_rsi(df)
+        macd, macd_signal = calc_macd(df)
+        df['macd'] = macd
+        df['macd_signal'] = macd_signal
+        df['short_mavg'] = df['close'].rolling(window=25).mean()
+        df['mid_mavg'] = df['close'].rolling(window=75).mean()
+        df['long_mavg'] = df['close'].rolling(window=200).mean()
+        latest = df.iloc[-1]
+        jpy, btc = get_balance()
+        current_price = latest['close']
+
+        # 利確・損切り判定（各ポジションごと）
+        sell_indices = []
+        for idx, pos in enumerate(positions):
+            profit_pct = (current_price - pos['price']) / pos['price'] * 100
+            if profit_pct >= PROFIT_TAKE_PCT:
+                print(f"利確シグナル: {profit_pct:.2f}%上昇→売却 {pos['amount']:.6f}BTC @ {pos['price']:.0f}")
+                place_order('sell', pos['amount'])
+                sell_indices.append(idx)
+            elif profit_pct <= -STOP_LOSS_PCT:
+                print(f"損切りシグナル: {profit_pct:.2f}%下落→売却 {pos['amount']:.6f}BTC @ {pos['price']:.0f}")
+                place_order('sell', pos['amount'])
+                sell_indices.append(idx)
+
+        # 売りシグナル（RSI, MACD, MAクロス）
+        if btc > MIN_ORDER_BTC:
+            sell_signal = False
+            if latest['rsi'] >= RSI_SELL:
+                print(f"RSI売りシグナル: RSI={latest['rsi']:.2f}")
+                sell_signal = True
+            if latest['macd'] < latest['macd_signal']:
+                print(f"MACDデッドクロス→売り")
+                sell_signal = True
+            if latest['short_mavg'] < latest['mid_mavg']:
+                print(f"MAクロス（短期<中期）→売り")
+                sell_signal = True
+            if sell_signal and positions:
+                for idx, pos in enumerate(positions):
+                    print(f"シグナル売却: {pos['amount']:.6f}BTC @ {pos['price']:.0f}")
+                    place_order('sell', pos['amount'])
+                    sell_indices.append(idx)
+
+        # 売却済みポジションをリストから削除
+        positions = [pos for idx, pos in enumerate(positions) if idx not in sell_indices]
+
+        # 買いシグナル（RSI, MACD, MAクロス）
+        if jpy > BALANCE_BUFFER:
+            buy_amount = min((jpy - BALANCE_BUFFER) * MAX_RISK_PERCENT / latest['close'], btc if btc else 1.0)
+            if buy_amount < MIN_ORDER_BTC:
+                buy_amount = MIN_ORDER_BTC
+            buy_signal = False
+            if latest['rsi'] <= RSI_BUY:
+                print(f"RSI買いシグナル: RSI={latest['rsi']:.2f}")
+                buy_signal = True
+            if latest['macd'] > latest['macd_signal']:
+                print(f"MACDゴールデンクロス→買い")
+                buy_signal = True
+            if latest['short_mavg'] > latest['mid_mavg']:
+                print(f"MAクロス（短期>中期）→買い")
+                buy_signal = True
+            if buy_signal:
+                place_order('buy', buy_amount)
+                positions.append({'price': current_price, 'amount': buy_amount, 'timestamp': time.time()})
+
+        print(f"待機中... JPY={jpy:.0f}, BTC={btc:.6f}, RSI={latest['rsi']:.2f}, MACD={latest['macd']:.2f}, MACDsig={latest['macd_signal']:.2f}, ポジション数={len(positions)}")
+        time.sleep(LOOP_INTERVAL)
+# --- メール通知関数の定義（未定義エラー対策） ---
+import smtplib
+from email.mime.text import MIMEText
+def send_notification(smtp_host, smtp_port, smtp_user, smtp_password, email_to, subject, message):
+    try:
+        msg = MIMEText(message)
+        msg['Subject'] = subject
+        msg['From'] = smtp_user
+        msg['To'] = email_to
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.sendmail(smtp_user, [email_to], msg.as_string())
+        print(f"📧 通知メール送信: {subject}")
+    except Exception as e:
+        print(f"⚠️ メール送信エラー: {e}")
 # --- FundManager, _adapt_fund_manager_instance の定義（stagingから移植） ---
 import json
 from typing import Optional
@@ -201,10 +350,12 @@ def log_warn(*args, **kwargs):
 # === DI対応版のエントリーポイント ===
 
 # --- 未定義グローバル変数・定数・関数のダミー定義・import ---
+import os
 try:
     from dotenv import load_dotenv
+    load_dotenv()
 except ImportError:
-    def load_dotenv(*a, **k): return False
+    pass
 env_paths = ['.env']
 DYN_OHLCV_DAYS = 30
 DYN_THRESHOLD_BUFFER_JPY = 1000
@@ -213,7 +364,6 @@ env_loaded = False
 DYN_THRESHOLD_RATIO = 1.0
 pair = 'BTC/JPY'
 days = 30
-import os
 buffer_jpy = int(os.getenv('BALANCE_BUFFER', 500))
 buffer_pct = 0.01
 # --- 未定義定数・変数のダミー定義 ---
@@ -307,309 +457,8 @@ try:
 except Exception:
     # Minimal pandas-like stub to avoid import errors and provide the small API used in this script.
     # NOTE: This is a lightweight compatibility shim for parsing/testing and does NOT replace real pandas.
-    class Series:
-        def __init__(self, values):
-            self.values = list(values) if values is not None else []
-            self._window = None
-
-        # --- ロギング関数の再定義 ---
-
-        # --- ロギング関数の再定義 ---
-
-        # --- ロギング関数の再定義 ---
-
-        # --- ロギング関数の再定義 ---
-
-        # --- ロギング関数の再定義 ---
-        import logging
-
-        # --- ロギング関数の再定義 ---
-        def rolling(self, window):
-            self._window = int(window)
-            return self
-
-        def mean(self):
-            vals = self.values
-            w = self._window or 1
-            if not vals:
-                return []
-            res = []
-            for i in range(len(vals)):
-                if i + 1 < w:
-                    res.append(None)
-                else:
-                    window_vals = [v for v in vals[i + 1 - w:i + 1] if v is not None]
-                    res.append(sum(window_vals) / len(window_vals) if window_vals else None)
-            return res
-
-        def __iter__(self):
-            return iter(self.values)
-
-    class Row:
-        def __init__(self, data):
-            self._data = data or {}
-
-        def __getitem__(self, key):
-            return self._data.get(key)
-
-        def __getattr__(self, name):
-            if name in self._data:
-                return self._data[name]
-            raise AttributeError(name)
-
-    class DataFrame:
-        def __init__(self, data=None, columns=None):
-            # data: list of lists (rows) or list of dicts
-            self._columns = list(columns) if columns else []
-            self._rows = []
-            if data:
-                if self._columns and all(isinstance(r, (list, tuple)) for r in data):
-                    for row in data:
-                        self._rows.append({c: v for c, v in zip(self._columns, row)})
-                elif all(isinstance(r, dict) for r in data):
-                    self._rows = [dict(r) for r in data]
-                    if not self._columns:
-                        cols = set()
-                        for r in self._rows:
-                            cols.update(r.keys())
-                        self._columns = list(cols)
-                else:
-                    # fallback: single column
-                    col = self._columns[0] if self._columns else "data"
-                    for r in data:
-                        self._rows.append({col: r})
-            self.index = None
-
-        def __len__(self):
-            return len(self._rows)
-
-        def __getitem__(self, key):
-            if isinstance(key, str):
-                vals = [row.get(key) for row in self._rows]
-                return Series(vals)
-            raise KeyError(key)
-
-        def __setitem__(self, key, value):
-            # value can be Series or iterable; align by index
-            vals = list(value) if hasattr(value, '__iter__') and not isinstance(value, (str, bytes)) else [value] * len(self._rows)
-            if not self._rows and vals:
-                for v in vals:
-                    self._rows.append({key: v})
-            else:
-                for i, v in enumerate(vals):
-                    if i < len(self._rows):
-                        self._rows[i][key] = v
-                    else:
-                        self._rows.append({key: v})
-            if key not in self._columns:
-                self._columns.append(key)
-
-        @property
-        def iloc(self):
-            class _Loc:
-                def __init__(self, rows):
-                    self._rows = rows
-
-                def __getitem__(self, idx):
-                    return Row(self._rows[idx])
-            return _Loc(self._rows)
-
-        def set_index(self, key):
-            self.index = key
-            return self
-
-    def to_datetime(values, unit='ms'):
-        out = []
-        for v in values:
-            try:
-                if v is None:
-                    out.append(None)
-                    continue
-                if unit == 'ms':
-                    ts = float(v) / 1000.0
-                else:
-                    ts = float(v)
-                out.append(datetime.datetime.fromtimestamp(ts))
-            except Exception:
-                out.append(None)
-        return out
-
-    import types
-    pd = types.SimpleNamespace(DataFrame=DataFrame, to_datetime=to_datetime)
-
-from zoneinfo import ZoneInfo  # 標準ライブラリのタイムゾーン処理
-#import time
-import json
-from pathlib import Path
-import math
-import os
-
-# Safety & strategy environment variables (defaults)
-MAX_SLIPPAGE_PCT = float(os.environ.get("MAX_SLIPPAGE_PCT", "0.5"))  # percent
-ORDER_EXECUTION_WINDOW_SEC = int(os.environ.get("ORDER_EXECUTION_WINDOW_SEC", "30"))
-COOLDOWN_SEC = int(os.environ.get("COOLDOWN_SEC", "3600"))  # 秒
-def safe_print(s: str) -> None:
-    # Print safely even when the console encoding can't represent some characters.
-    # Replaces unencodable characters with the platform replacement character.
-    print(s)
-for env_path in env_paths:
-    if load_dotenv(dotenv_path=env_path):
-        safe_print(f"[OK] 環境変数を {env_path} から読み込みました")
-        env_loaded = True
-        break
-
-if not env_loaded:
-    safe_print("[WARN] .env ファイルが見つかりません。環境変数は systemd EnvironmentFile から読み込まれます。")
-
-# グローバルに使う API キーを一度だけ読み込む
-API_KEY = os.getenv("API_KEY")
-SECRET_KEY = os.getenv("SECRET_KEY")
-
-# 日本標準時 (JST) のタイムゾーンオブジェクトを作成
-try:
-    JST = ZoneInfo('Asia/Tokyo')
-except Exception:
-    # Windows 等で tzdata が無い環境では ZoneInfo が ZoneInfoNotFoundError を出すことがあるため
-    # 安全に固定オフセットで JST を作成してフォールバックします（UTC+9）。
-    JST = datetime.timezone(datetime.timedelta(hours=9))
-
-# === 環境変数の取得（実行時チェック用にグローバル変数として定義） ===
-smtp_user = os.getenv("SMTP_USER")
-smtp_password = os.getenv("SMTP_PASS")  # .env.newに合わせてSMTP_PASSに変更
-email_to = os.getenv("TO_EMAIL")  # .env.newに合わせてTO_EMAILに変更
-smtp_host = os.getenv("SMTP_HOST")  # キー名を取得する変数を smtp_host に変更
-# モジュールレベルでのチェックを削除（実行時にチェックするように変更）
-
-subject = os.getenv("SUBJECT", "📬 通知")
-
-# === SMTP_PORT の安全な読み込み ===
-# デフォルトを 465 (SMTPS) にしておきます。環境変数があればそれを使い、整数変換に失敗したら 465 にフォールバックします。
-port_str = os.getenv("SMTP_PORT", "465")
-try:
-    smtp_port = int(port_str)
-except Exception:
-    smtp_port = 465
-
-# === メール送信関数 ===
-def send_notification(smtp_host, smtp_port, smtp_user, smtp_password, to, subject, body):
-    # 安全化したメール送信ラッパー。
-    # - DRY_RUN のときは送信をスキップする。
-    # - SMTP ホスト/宛先が未設定のときは送信をスキップする。
-    # - 接続タイムアウトを短くしてブロックを避ける。
-    # Returns True on success, False otherwise.
-    from email.mime.text import MIMEText
-    import smtplib
-    import os
-
-    # DRY_RUN のときは送信をスキップ (成功扱いにすることで通知ループを防ぐ)
-    if str(os.getenv('DRY_RUN', '0')).lower() in ('1', 'true', 'yes', 'on'):
-        log_info('ℹ️ DRY_RUN が有効のためメール送信をスキップします')
-        return True
-
-    # 必須情報が無ければ送信をスキップ
-    if not smtp_host or not to:
-        log_warn('ℹ️ SMTP ホストまたは宛先が未設定のためメール送信をスキップします')
-        return False
-
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = smtp_user or ''
-    msg["To"] = to
-
-    # SMTPS 判定（環境変数が無ければポート465を SMTPS と判断）
-    use_ssl_env = os.getenv("SMTP_USE_SSL")
-    if use_ssl_env is None:
-        try:
-            use_ssl = (int(smtp_port) == 465)
-        except Exception:
-            use_ssl = True
-    else:
-        use_ssl = str(use_ssl_env).lower() in ("1", "true", "yes", "on")
-
-    # 接続タイムアウト（秒）を短めにする
-    try:
-        timeout_sec = float(os.getenv('SMTP_CONNECT_TIMEOUT', '10'))
-    except Exception:
-        timeout_sec = 10.0
-
-    if use_ssl:
-        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=timeout_sec) as server:
-            if smtp_user and smtp_password:
-                try:
-                    server.login(smtp_user, smtp_password)
-                except Exception as e:
-                    try:
-                        log_warn(f'⚠️ SMTP 認証失敗: {e}')
-                    except Exception:
-                        print(f'⚠️ SMTP 認証失敗: {e}')
-            server.send_message(msg)
-    else:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=timeout_sec) as server:
-            try:
-                server.starttls()
-            except Exception:
-                # StartTLS が使えない環境でもログは残す
-                pass
-            if smtp_user and smtp_password:
-                try:
-                    server.login(smtp_user, smtp_password)
-                except Exception as e:
-                    try:
-                        log_warn(f'⚠️ SMTP 認証失敗: {e}')
-                    except Exception:
-                        print(f'⚠️ SMTP 認証失敗: {e}')
-            server.send_message(msg)
-    try:
-        log_info("✅ メール送信成功")
-    except Exception:
-        log_info("✅ メール送信成功")
-    return True
-
-
-# 取引所の設定を取得
-exchange_name = os.getenv("EXCHANGE", "bitbank")
-
-
-# === メイン処理開始（Botの心臓が動き出す） ===
-
-if __name__ == "__main__":
-    # --- 多重起動防止: FileLockで排他制御 ---
-    from filelock import Timeout, FileLock
-    LOCKFILE_PATH = os.getenv('ORDER_LOCKFILE', '/tmp/ninibo_order.lock')
-    lock = FileLock(LOCKFILE_PATH)
-    try:
-        lock.acquire(timeout=1)
-    except Timeout:
-        print("❌ すでにBotが起動中です。多重起動はできません。終了します。")
-        sys.exit(1)
-    try:
-        log_info("Bot起動中...")
-    except Exception:
-        log_info("Bot起動中...")
-        # Botのメイン処理を呼び出し（自動売買ロジック有効化）
-        run_bot_di()
-
-# 1. 初期設定と認証 (APIキーの読み込みはここにあります)
-
-# .envファイルからAPIキーを読み込みます（config.envから統合済み）
-
- 
-# ※注意: APIキー読み込みと bitbank インスタンスの直接作成は
-# connect_to_bitbank() に統合しました。元の直接作成コードを削除しています。
-# 必要であれば、環境変数の確認は connect_to_bitbank() 呼び出し時に行われます。
-
-# 旧来の直接接続テスト/監視ループは削除しました。
-# 取引所接続とループは connect_to_bitbank() と run_bot() に統合されています。
-
-
-# ==========================================================
-# 🔑 2. グローバルキー読み込みと定義 (修正点: 最上部に移動)
-# ==========================================================
-#.env# config.envからAPIキーを読み込みます
-
-load_dotenv(dotenv_path='.env') 
-API_KEY = os.getenv("API_KEY") # グローバル定数として定義
-SECRET_KEY = os.getenv("SECRET_KEY") # グローバル定数として定義
+    # BotのDIエントリーポイントで起動
+    run_bot_di()
 
 # 日本標準時 (JST) のタイムゾーンオブジェクトを作成
 try:
@@ -1496,10 +1345,20 @@ def generate_signals(df):
             log_warn(f"⚠️ データが不足しています。最低200本必要ですが、{len(df) if df is not None else 0}本しかありません。")
         return None
 
+
     # 短期25、中期75、長期200を追加
     df['short_mavg'] = df['close'].rolling(window=25).mean()
-    df['mid_mavg'] = df['close'].rolling(window=75).mean() # 75をmidに名称変更
-    df['long_mavg'] = df['close'].rolling(window=200).mean() # 新しい長期MA
+    df['mid_mavg'] = df['close'].rolling(window=75).mean()
+    df['long_mavg'] = df['close'].rolling(window=200).mean()
+
+    # RSI計算（14期間）
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.rolling(window=14).mean()
+    avg_loss = loss.rolling(window=14).mean()
+    rs = avg_gain / avg_loss
+    df['rsi'] = 100 - (100 / (1 + rs))
 
     latest_data = df.iloc[-1]
     previous_data = df.iloc[-2]
@@ -1507,30 +1366,32 @@ def generate_signals(df):
     signal = None
     message = None
 
-    # 🔑 トレンドフィルター
+    # RSIによる売買判定
+    if latest_data['rsi'] <= 30:
+        signal = 'buy_entry'
+        message = f"✅ RSI買いシグナル: RSI={latest_data['rsi']:.2f} (30以下)"
+        return signal, message
+    elif latest_data['rsi'] >= 70:
+        signal = 'sell_all'
+        message = f"❌ RSI売りシグナル: RSI={latest_data['rsi']:.2f} (70以上)"
+        return signal, message
+
+    # 従来のトレンドフィルターも残す
     is_uptrend = latest_data['mid_mavg'] > latest_data['long_mavg']
     mid_mavg_is_rising = latest_data['mid_mavg'] > previous_data['mid_mavg']
 
-    # --- 買いシグナル 1：新規エントリー (ゴールデンクロス) ---
     if (previous_data['short_mavg'] <= previous_data['mid_mavg'] and
         latest_data['short_mavg'] > latest_data['mid_mavg'] and
         is_uptrend and mid_mavg_is_rising):
-        signal = 'buy_entry' # 新規エントリーシグナル
+        signal = 'buy_entry'
         message = "✅ 新規エントリーシグナル (GC 25/75、トレンド確認) が発生しました。"
         return signal, message
-
-    # --- 買いシグナル 2：買い増し (押し目) ---
-    # 注: GC後、ポジション保有中に価格がMA25を上回っている（押し目買い）でトレンド上昇中
     elif latest_data['close'] > latest_data['short_mavg'] and is_uptrend:
-        signal = 'buy_add' 
+        signal = 'buy_add'
         message =  "📈 買い増しシグナル (押し目買い) が発生しました。"
-        
-    # --- 売りシグナル：全決済 (トレンド終了) ---
-    # MA75がMA200を下回った、またはMA75が下向きに転じた
     elif not is_uptrend or latest_data['mid_mavg'] < previous_data['mid_mavg']:
         signal = 'sell_all'
         message = "❌ 全決済シグナル (長期トレンド終了/反転) が発生しました。"
-    
     return signal, message
 
 
@@ -2698,13 +2559,19 @@ def run_bot_di(dry_run=False, exchange_override=None):
     fund_manager = None
     
     try:
-        # TODO: ここでBotのメイン処理関数を呼び出してください（例: run_bot(exchange, fund_manager, actual_dry_run) など）
-        # run_bot(exchange, fund_manager, actual_dry_run)
-        print("[仮] Botメイン処理をここで実行")
-        return {"status": "success", "message": "Bot実行完了"}
+        # メインループをrun_botとして呼び出す
+        result = run_bot(exchange, _raw_fm, actual_dry_run)
+        return {"status": "success", "message": "Bot実行完了", "result": result}
     except Exception as e:
         return {"status": "error", "message": f"Bot実行中にエラー: {e}"}
     return None
+# === メインループ本体 ===
+def run_bot(exchange, fund_manager, dry_run=False):
+    # ここにBotのメイン処理を記述（例: 1回だけ動作する簡易版）
+    print(f"run_bot() called: exchange={exchange}, fund_manager={fund_manager}, dry_run={dry_run}")
+    # 実際の自動売買ロジックをここに実装する
+    # 例: 価格取得・注文・ログ出力など
+    return "run_bot executed"
 
 
 
