@@ -7,8 +7,9 @@ class FundAdapter:
         self.fund += amount
         return True
 
-# --- 注文実行ユーティリティ ---
+# --- 注文実行ユーティティ ---
 def execute_order(exchange, pair, order_type, amount, price=None):
+
     # Place order on Bitbank (ccxt)
     try:
         order = None
@@ -31,6 +32,7 @@ def execute_order(exchange, pair, order_type, amount, price=None):
 
         else:
             print(f"無効な注文タイプです: {order_type}")
+            
             # return None  # ← 関数外のため削除
 
         if order and isinstance(order, dict) and 'id' in order:
@@ -2201,43 +2203,33 @@ if __name__ == "__main__":
                         trigger_percent = 20.0
 
                 # === ここから自動売却ロジック ===
-                # ポジションが存在し、売りトリガーを超えたら自動売却
+                # ポジションが存在し、各ポジションごとに売りトリガーを超えたら自動売却
                 try:
                     positions = state.get('positions') if isinstance(state, dict) else None
+                    sold_positions = []
                     if positions and isinstance(positions, list) and len(positions) > 0:
-                        # 直近のポジション（買い）を取得
-                        last_pos = positions[-1]
-                        entry_price = float(last_pos.get('entry_price', 0.0))
-                        qty = float(last_pos.get('qty', 0.0))
-                        # 売りトリガー価格
                         sell_trigger_pct = float(os.getenv('TRADE_TRIGGER_PCT', '20.0'))
-                        sell_trigger_price = entry_price * (1.0 + sell_trigger_pct / 100.0)
-                        # 売り条件成立
-                        if latest_price and entry_price > 0 and float(latest_price) >= sell_trigger_price and qty > 0:
-                            print(f"🚀 売りシグナル: entry={entry_price:.0f}円, trigger={sell_trigger_price:.0f}円, 現在={latest_price:.0f}円, qty={qty}")
-                            # 売却実行
-                            order = execute_order(exchange, 'BTC/JPY', 'sell', qty)
-                            print(f"DEBUG: execute_order(sell) returned: {order}")
-                            # ポジション記録
-                            record_position(state, 'sell', float(latest_price), qty)
-                            # ポジションをクリア
-                            state['positions'] = []
-                            # 監視基準をリセット
-                            state['watch_reference'] = float(latest_price)
-                            save_state(state)
-                            # 通知
-                            try:
-                                smtp_host = os.getenv('SMTP_HOST')
-                                smtp_port = int(os.getenv('SMTP_PORT', '587'))
-                                smtp_user = os.getenv('SMTP_USER')
-                                smtp_password = os.getenv('SMTP_PASS')
-                                email_to = os.getenv('TO_EMAIL')
-                                if smtp_host and email_to:
-                                    subject = f"BTC Auto Sell Complete: {qty:.4f} BTC"
-                                    # watch_refが未定義の場合はentry_priceまたはreference_priceを使う
-                                    try:
-                                        safe_watch_ref = watch_ref
-                                    except Exception:
+                        for pos in positions[:]:
+                            entry_price = float(pos.get('price', 0.0))
+                            qty = float(pos.get('qty', 0.0))
+                            sell_trigger_price = entry_price * (1.0 + sell_trigger_pct / 100.0)
+                            if latest_price and entry_price > 0 and float(latest_price) >= sell_trigger_price and qty > 0:
+                                print(f"🚀 売りシグナル: entry={entry_price:.0f}円, trigger={sell_trigger_price:.0f}円, 現在={latest_price:.0f}円, qty={qty}")
+                                # 売却実行
+                                order = execute_order(exchange, 'BTC/JPY', 'sell', qty)
+                                print(f"DEBUG: execute_order(sell) returned: {order}")
+                                # ポジション記録
+                                record_position(state, 'sell', float(latest_price), qty)
+                                sold_positions.append(pos)
+                                # 通知
+                                try:
+                                    smtp_host = os.getenv('SMTP_HOST')
+                                    smtp_port = int(os.getenv('SMTP_PORT', '587'))
+                                    smtp_user = os.getenv('SMTP_USER')
+                                    smtp_password = os.getenv('SMTP_PASS')
+                                    email_to = os.getenv('TO_EMAIL')
+                                    if smtp_host and email_to:
+                                        subject = f"BTC Auto Sell Complete: {qty:.4f} BTC"
                                         try:
                                             safe_watch_ref = entry_price
                                         except Exception:
@@ -2245,7 +2237,26 @@ if __name__ == "__main__":
                                                 safe_watch_ref = reference_price
                                             except Exception:
                                                 safe_watch_ref = 0.0
-                                    message = (
+                                        message = (
+                                            f"BTC auto sell completed!\n\n"
+                                            f"[Sell Info]\n"
+                                            f"Amount: {qty:.4f} BTC\n"
+                                            f"Sell Price: {latest_price:,.0f} JPY/BTC\n"
+                                            f"Entry Price: {entry_price:,.0f} JPY\n"
+                                            f"Reference: {safe_watch_ref:,.0f} JPY\n"
+                                            f"Profit: approx. {(latest_price-entry_price)*qty:,.0f} JPY\n\n"
+                                            f"Position cleared.\n"
+                                        )
+                                        send_notification(smtp_host, smtp_port, smtp_user, smtp_password, email_to, subject, message)
+                                        print(f"📧 売却完了通知メール送信完了")
+                                except Exception as e:
+                                    print(f"⚠️ 売却通知メール送信エラー: {e}")
+                        # 売却済みポジションのみ削除
+                        for sold in sold_positions:
+                            positions.remove(sold)
+                        # 監視基準をリセット（最新価格）
+                        state['watch_reference'] = float(latest_price)
+                        save_state(state)
                                         f"BTC auto sell completed!\n\n"
                                         f"[Sell Info]\n"
                                         f"Amount: {qty:.4f} BTC\n"
