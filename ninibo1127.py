@@ -2257,19 +2257,6 @@ if __name__ == "__main__":
                         # 監視基準をリセット（最新価格）
                         state['watch_reference'] = float(latest_price)
                         save_state(state)
-                                        f"BTC auto sell completed!\n\n"
-                                        f"[Sell Info]\n"
-                                        f"Amount: {qty:.4f} BTC\n"
-                                        f"Sell Price: {latest_price:,.0f} JPY/BTC\n"
-                                        f"Entry Price: {entry_price:,.0f} JPY\n"
-                                        f"Reference: {safe_watch_ref:,.0f} JPY\n"
-                                        f"Profit: approx. {(latest_price-entry_price)*qty:,.0f} JPY\n\n"
-                                        f"Position cleared.\n"
-                                    )
-                                    send_notification(smtp_host, smtp_port, smtp_user, smtp_password, email_to, subject, message)
-                                    print(f"📧 売却完了通知メール送信完了")
-                            except Exception as e:
-                                print(f"⚠️ 売却通知メール送信エラー: {e}")
                 except Exception as e:
                     print(f"⚠️ 自動売却処理で例外: {e}")
                     
