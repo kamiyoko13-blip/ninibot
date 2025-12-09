@@ -1,0 +1,43 @@
+  File "/home/ninitan/notify_project/ninibo1127.py", line 2260
+    f"BTC auto sell completed!\n\n"
+IndentationError: unexpected indent
+  File "/home/ninitan/notify_project/ninibo1127.py", line 2260
+    f"BTC auto sell completed!\n\n"
+IndentationError: unexpected indent
+  File "/home/ninitan/notify_project/ninibo1127.py", line 2260
+    f"BTC auto sell completed!\n\n"
+IndentationError: unexpected indent
+Bot起動中...
+🚀 Bot開始 (本番モード)
+reserve/place_order(500) -> True
+available after reserve: 500.0
+after add_funds available: 1000.0
+dry initial available: 1000.0
+dry reserve(300) -> True available-> 700.0
+✅ bitbankにccxtで認証接続しました。
+🔁 自動売買Botを継続運用モードで起動します
+🔁 自動売買Botを継続運用モードで起動します
+DEBUG: __main__ start - DRY_RUN=False
+DEBUG: save_state succeeded and replaced funds_state.json (size=247)
+Traceback (most recent call last):
+  File "/home/ninitan/notify_project/ninibo1127.py", line 2456, in <module>
+    time.sleep(3600)  # 1時間待機
+    ^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+Bot起動中...
+🚀 Bot開始 (本番モード)
+reserve/place_order(500) -> True
+available after reserve: 500.0
+after add_funds available: 1000.0
+dry initial available: 1000.0
+dry reserve(300) -> True available-> 700.0
+✅ bitbankにccxtで認証接続しました。
+🔁 自動売買Botを継続運用モードで起動します
+🔁 自動売買Botを継続運用モードで起動します
+DEBUG: __main__ start - DRY_RUN=False
+DEBUG: save_state succeeded and replaced funds_state.json (size=247)
+Traceback (most recent call last):
+  File "/home/ninitan/notify_project/ninibo1127.py", line 2456, in <module>
+    time.sleep(3600)  # 1時間待機
+    ^^^^^^^^^^^^^^^^
+KeyboardInterrupt
