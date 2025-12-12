@@ -82,6 +82,7 @@ def run_bot_di(dry_run=False, exchange_override=None):
         while True:
             result = run_bot(exchange, _raw_fm, dry_run)
             print("5分待機します...")
+            import time
             time.sleep(300)  # 5分ごとに判定
         # returnはループ外（通常到達しない）
         # return {"status": "success", "message": "Bot実行完了", "result": result}
